@@ -171,13 +171,18 @@ check_udp_range_conflict() {
     local end="$2"
     local p
     local conflicts=()
-    local shown=0
+    local used_ports=""
+
+    # 一次性获取所有 UDP 监听端口列表，避免逐个端口调用 ss（1000 端口范围时性能提升显著）
+    if has_cmd ss; then
+        used_ports=$(ss -H -uln 2>/dev/null | awk '{print $5}' | sed 's/.*://g')
+    fi
+    [[ -z "$used_ports" ]] && return 0
 
     for ((p=start; p<=end; p++)); do
-        if is_udp_port_in_use "$p"; then
+        if grep -wq "$p" <<< "$used_ports" 2>/dev/null; then
             conflicts+=("$p")
-            ((shown++))
-            [[ $shown -ge 8 ]] && break
+            [[ ${#conflicts[@]} -ge 8 ]] && break
         fi
     done
 
@@ -860,6 +865,13 @@ inst_bandwidth(){
 }
 
 generate_config(){
+    # 如果已有配置，改前备份
+    if [[ -f /etc/hysteria/config.yaml ]]; then
+        local bak_file="/etc/hysteria/config.yaml.bak.$(date +%s)"
+        cp /etc/hysteria/config.yaml "$bak_file" 2>/dev/null || true
+        chmod 600 "$bak_file" 2>/dev/null || true
+    fi
+
     mkdir -p /etc/hysteria
 
     yaml_cert_path=$(yaml_escape "$cert_path")
