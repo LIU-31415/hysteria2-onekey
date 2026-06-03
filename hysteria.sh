@@ -28,6 +28,9 @@ IPTABLES_NAT_COMMENT="hy2-port-hop"
 IPTABLES_INPUT_COMMENT="hy2-udp-input"
 PORT_STATE_FILE="/etc/hysteria/port_state.conf"
 
+# 脚本仓库地址（更新和 hy2 重装使用）
+REPO_URL="https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh"
+
 has_cmd() {
     command -v "$1" >/dev/null 2>&1
 }
@@ -416,7 +419,6 @@ EOS
 
 install_management_command() {
     local src=""
-    local repo_url="https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh"
 
     if [[ -n ${BASH_SOURCE[0]} && -f ${BASH_SOURCE[0]} ]]; then
         src="${BASH_SOURCE[0]}"
@@ -434,9 +436,9 @@ install_management_command() {
     green "检测到脚本通过管道运行，正在从仓库获取脚本以安装管理命令..."
 
     if command -v curl &>/dev/null; then
-        curl -sL -o /usr/bin/hy2 "$repo_url" && chmod 755 /usr/bin/hy2
+        curl -sL -o /usr/bin/hy2 "$REPO_URL" && chmod 755 /usr/bin/hy2
     elif command -v wget &>/dev/null; then
-        wget -qO /usr/bin/hy2 "$repo_url" && chmod 755 /usr/bin/hy2
+        wget -qO /usr/bin/hy2 "$REPO_URL" && chmod 755 /usr/bin/hy2
     fi
 
     if [[ -f /usr/bin/hy2 && -s /usr/bin/hy2 ]]; then
@@ -446,7 +448,7 @@ install_management_command() {
         rm -f /usr/bin/hy2
         red "无法自动写入 /usr/bin/hy2：下载失败。"
         red "安装完成后请手动执行以下命令："
-        red "  curl -sL -o /usr/bin/hy2 $repo_url && chmod 755 /usr/bin/hy2"
+        red "  curl -sL -o /usr/bin/hy2 $REPO_URL && chmod 755 /usr/bin/hy2"
         return 1
     fi
 }
@@ -565,7 +567,10 @@ inst_cert(){
                 systemctl enable cron
             fi
 
-            curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
+            curl -fsSL https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com || {
+                red "acme.sh 安装失败，请检查网络连接后重试"
+                exit 1
+            }
             source ~/.bashrc
             bash ~/.acme.sh/acme.sh --upgrade --auto-upgrade
             bash ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
@@ -1085,7 +1090,7 @@ EOF
 read_current_config(){
     if [[ -f /etc/hysteria/config.yaml ]]; then
         # 端口解析：支持 ":443"、"0.0.0.0:443"、"[::]:443" 三种格式
-        port=$(grep "^listen:" /etc/hysteria/config.yaml | sed 's/^listen:[[:space:]]*//' | rev | cut -d: -f1 | rev)
+        port=$(grep "^listen:" /etc/hysteria/config.yaml | sed 's/^listen:[[:space:]]*//' | sed 's/.*://')
         cert_path=$(yaml_unescape "$(grep "^[[:space:]]*cert:" /etc/hysteria/config.yaml | sed 's/^[[:space:]]*cert:[[:space:]]*//')")
         key_path=$(yaml_unescape "$(grep "^[[:space:]]*key:" /etc/hysteria/config.yaml | sed 's/^[[:space:]]*key:[[:space:]]*//')")
         auth_pwd=$(yaml_unescape "$(grep "^[[:space:]]*password:" /etc/hysteria/config.yaml | sed 's/^[[:space:]]*password:[[:space:]]*//')")
@@ -1164,23 +1169,8 @@ insthysteria(){
         systemctl stop hysteria-server
     fi
 
-    # WARP 保护：先关闭 WARP 获取真实 IP，确保退出时恢复
-    _warp_cleanup() {
-        systemctl start warp-go >/dev/null 2>&1 || true
-        wg-quick up wgcf >/dev/null 2>&1 || true
-    }
-    warpv6=$(curl -s6m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
-    warpv4=$(curl -s4m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
-    if [[ $warpv4 =~ on|plus || $warpv6 =~ on|plus ]]; then
-        wg-quick down wgcf >/dev/null 2>&1
-        systemctl stop warp-go >/dev/null 2>&1
-        trap '_warp_cleanup' EXIT
-        realip
-        _warp_cleanup
-        trap - EXIT
-    else
-        realip
-    fi
+    # 获取服务器公网 IP（证书和客户端配置需要）
+    realip
 
     if [[ $SYSTEM == "CentOS" ]]; then
         ${PACKAGE_INSTALL[int]} curl wget sudo qrencode procps openssl iproute acl
@@ -1214,8 +1204,6 @@ insthysteria(){
     sleep 5
     systemctl start hysteria-server
 
-    install_management_command
-
     sleep 2
     if systemctl is-active --quiet hysteria-server && [[ -f '/etc/hysteria/config.yaml' ]]; then
         green "Hysteria 2 服务启动成功"
@@ -1231,11 +1219,11 @@ insthysteria(){
     green "======================================================================================"
 
     yellow "Hysteria 2 客户端 YAML 配置文件 hy-client.yaml 内容如下"
-    red "$(cat /root/hy/hy-client.yaml)"
+    green "$(cat /root/hy/hy-client.yaml)"
     yellow "Hysteria 2 客户端 JSON 配置文件 hy-client.json 内容如下"
-    red "$(cat /root/hy/hy-client.json)"
+    green "$(cat /root/hy/hy-client.json)"
     yellow "Hysteria 2 节点分享链接如下"
-    red "$(cat /root/hy/url.txt)"
+    green "$(cat /root/hy/url.txt)"
 }
 
 unsthysteria(){
@@ -1414,11 +1402,11 @@ showconf(){
         return 1
     fi
     yellow "Hysteria 2 客户端 YAML 配置文件 hy-client.yaml 内容如下"
-    red "$(cat /root/hy/hy-client.yaml)"
+    green "$(cat /root/hy/hy-client.yaml)"
     yellow "Hysteria 2 客户端 JSON 配置文件 hy-client.json 内容如下"
-    red "$(cat /root/hy/hy-client.json)"
+    green "$(cat /root/hy/hy-client.json)"
     yellow "Hysteria 2 节点分享链接如下"
-    red "$(cat /root/hy/url.txt)"
+    green "$(cat /root/hy/url.txt)"
 }
 
 menu() {
@@ -1452,15 +1440,14 @@ menu() {
 
 # 更新脚本
 update_script() {
-    local repo_url="https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh"
     local tmp_file="/tmp/hysteria-update.sh"
 
     yellow "正在检查脚本更新..."
 
     if command -v curl &>/dev/null; then
-        curl -sL -o "$tmp_file" "$repo_url" || { red "下载失败"; return 1; }
+        curl -sL -o "$tmp_file" "$REPO_URL" || { red "下载失败"; return 1; }
     elif command -v wget &>/dev/null; then
-        wget -qO "$tmp_file" "$repo_url" || { red "下载失败"; return 1; }
+        wget -qO "$tmp_file" "$REPO_URL" || { red "下载失败"; return 1; }
     else
         red "更新失败：未找到 curl 或 wget"
         return 1
@@ -1500,7 +1487,9 @@ case "$1" in
     --reinstall|-f)
         FORCE_INSTALL=1
         insthysteria
-        exit $?
+        local rc=$?
+        install_management_command
+        exit $rc
         ;;
 esac
 
