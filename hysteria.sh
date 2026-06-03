@@ -1154,11 +1154,13 @@ read_current_config(){
 }
 
 insthysteria(){
-    # 前置检测：已安装则提示
+    # 前置检测：已安装则提示（--reinstall / -f 跳过确认）
     if systemctl is-active --quiet hysteria-server 2>/dev/null; then
-        red "检测到 Hysteria 2 服务已在运行！"
-        read -rp "是否覆盖安装？(y/N): " confirm
-        [[ $confirm != "y" && $confirm != "Y" ]] && yellow "已取消安装" && exit 0
+        if [[ $FORCE_INSTALL != "1" ]]; then
+            red "检测到 Hysteria 2 服务已在运行！"
+            read -rp "是否覆盖安装？(y/N): " confirm
+            [[ $confirm != "y" && $confirm != "Y" ]] && yellow "已取消安装" && exit 0
+        fi
         systemctl stop hysteria-server
     fi
 
@@ -1491,6 +1493,16 @@ update_script() {
     green "请重新运行脚本以使用最新版本。"
     exit 0
 }
+
+# 入口：参数解析
+FORCE_INSTALL=0
+case "$1" in
+    --reinstall|-f)
+        FORCE_INSTALL=1
+        insthysteria
+        exit $?
+        ;;
+esac
 
 # 入口：每次运行均同步管理命令到 /usr/bin/hy2
 # 这样无论通过哪种方式更新脚本，下次运行 hy2 即是最新版

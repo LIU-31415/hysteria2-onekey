@@ -18,6 +18,11 @@ bash <(wget -qO- https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/ma
 
 运行后自动进入管理菜单，输入 `1` 按提示完成安装即可。
 
+> 💡 **已安装过？** 想覆盖重装可以跳过菜单，一步到位：
+> ```bash
+> bash <(curl -sL https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh) --reinstall
+> ```
+
 ### 方式二：手动下载安装
 
 想先审查脚本内容，或需要离线安装时使用：
