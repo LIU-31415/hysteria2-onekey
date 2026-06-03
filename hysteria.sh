@@ -416,6 +416,7 @@ EOS
 
 install_management_command() {
     local src=""
+    local repo_url="https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh"
 
     if [[ -n ${BASH_SOURCE[0]} && -f ${BASH_SOURCE[0]} ]]; then
         src="${BASH_SOURCE[0]}"
@@ -425,8 +426,27 @@ install_management_command() {
 
     if [[ -n "$src" ]]; then
         install -m 755 "$src" /usr/bin/hy2
+        return $?
+    fi
+
+    # 管道运行（bash <(curl ...)）或 /dev/fd/ 等无物理文件的情况
+    # 从 GitHub 重新下载一份作为管理命令
+    green "检测到脚本通过管道运行，正在从仓库获取脚本以安装管理命令..."
+
+    if command -v curl &>/dev/null; then
+        curl -sL -o /usr/bin/hy2 "$repo_url" && chmod 755 /usr/bin/hy2
+    elif command -v wget &>/dev/null; then
+        wget -qO /usr/bin/hy2 "$repo_url" && chmod 755 /usr/bin/hy2
+    fi
+
+    if [[ -f /usr/bin/hy2 && -s /usr/bin/hy2 ]]; then
+        green "管理命令 hy2 安装成功！"
+        return 0
     else
-        red "无法自动写入 /usr/bin/hy2：请将脚本保存为文件后运行，或手动复制到 /usr/bin/hy2"
+        rm -f /usr/bin/hy2
+        red "无法自动写入 /usr/bin/hy2：下载失败。"
+        red "安装完成后请手动执行以下命令："
+        red "  curl -sL -o /usr/bin/hy2 $repo_url && chmod 755 /usr/bin/hy2"
         return 1
     fi
 }
