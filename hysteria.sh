@@ -1446,4 +1446,8 @@ menu() {
     esac
 }
 
+# 入口：每次运行均同步管理命令到 /usr/bin/hy2
+# 这样无论通过哪种方式更新脚本，下次运行 hy2 即是最新版
+install_management_command
+
 menu
