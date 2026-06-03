@@ -1431,19 +1431,65 @@ menu() {
     echo -e " 3. 关闭、开启、重启 Hysteria 2"
     echo -e " 4. 修改 Hysteria 2 配置"
     echo -e " 5. 显示 Hysteria 2 配置文件"
+    echo -e " 6. 更新脚本"
     echo " ------------------------------------------------------------"
     echo -e " 0. 退出脚本"
     echo ""
-    read -rp "请输入选项 [0-5]: " menuInput
+    read -rp "请输入选项 [0-6]: " menuInput
     case $menuInput in
         1 ) insthysteria ;;
         2 ) unsthysteria ;;
         3 ) hysteriaswitch ;;
         4 ) changeconf ;;
         5 ) showconf ;;
+        6 ) update_script ;;
         0 ) exit 0 ;;
         * ) exit 1 ;;
     esac
+}
+
+# 更新脚本
+update_script() {
+    local repo_url="https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh"
+    local tmp_file="/tmp/hysteria-update.sh"
+
+    yellow "正在检查脚本更新..."
+
+    if command -v curl &>/dev/null; then
+        curl -sL -o "$tmp_file" "$repo_url" || { red "下载失败"; return 1; }
+    elif command -v wget &>/dev/null; then
+        wget -qO "$tmp_file" "$repo_url" || { red "下载失败"; return 1; }
+    else
+        red "更新失败：未找到 curl 或 wget"
+        return 1
+    fi
+
+    if [[ ! -f "$tmp_file" || ! -s "$tmp_file" ]]; then
+        red "更新失败：无法从仓库获取脚本"
+        return 1
+    fi
+
+    # 校验：确保下载的是 bash 脚本
+    if ! head -1 "$tmp_file" | grep -qE '^#!/bin/bash'; then
+        red "更新失败：下载的文件不是有效的脚本"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    # 安装到 /usr/bin/hy2
+    install -m 755 "$tmp_file" /usr/bin/hy2
+    green "脚本更新成功！"
+
+    # 如果当前目录有 hysteria.sh，一并更新
+    if [[ -f ./hysteria.sh ]]; then
+        cp "$tmp_file" ./hysteria.sh
+        chmod +x ./hysteria.sh
+        green "本地脚本 hysteria.sh 已同步更新"
+    fi
+
+    rm -f "$tmp_file"
+    green "请重新运行脚本以使用最新版本。"
+    exit 0
 }
 
 # 入口：每次运行均同步管理命令到 /usr/bin/hy2
