@@ -4,19 +4,37 @@ Hysteria 2 服务端一键安装/管理脚本，适用于 Linux VPS（Debian/Ubu
 
 ## 快速开始
 
-### 1. 上传脚本到 VPS
+### 方式一：一键安装（推荐）
 
-将 `hysteria.sh` 上传到 VPS，例如用 FinalShell 拖进去。
-
-### 2. 执行安装
+SSH 登录 VPS 后，直接运行以下命令即可：
 
 ```bash
-# root 用户运行
+# 使用 curl
+bash <(curl -sL https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh)
+
+# 或使用 wget
+bash <(wget -qO- https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh)
+```
+
+运行后自动进入管理菜单，输入 `1` 按提示完成安装即可。
+
+### 方式二：手动下载安装
+
+想先审查脚本内容，或需要离线安装时使用：
+
+```bash
+# 下载脚本
+wget https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh
+
+# 或从 Releases 下载最新版
+# wget https://github.com/LIU-31415/hysteria2-onekey/releases/latest/download/hysteria.sh
+
+# 赋予执行权限并运行
 chmod +x hysteria.sh
 bash hysteria.sh
 ```
 
-### 3. 菜单操作
+### 管理菜单
 
 ```
 输入 1 → 安装（按提示选择配置）
