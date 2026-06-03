@@ -680,12 +680,12 @@ inst_port_config(){
     else
         green "已选择端口跳跃模式。"
         yellow "注意：请仔细检查服务器是否存在端口冲突（如Web服务的80/443等）。"
-        yellow "推荐：结束端口与起始端口的差值建议在 100 以内。"
+        yellow "推荐：范围大小约 1000 个端口，位于 30000-50000 高位区间。"
         echo ""
 
         while true; do
-            read -rp "请输入起始端口/主端口 [建议2500-10000] (回车随机生成): " firstport
-            [[ -z $firstport ]] && firstport=$(shuf -i 2500-10000 -n 1)
+            read -rp "请输入起始端口/主端口 [建议30000-50000] (回车随机生成): " firstport
+            [[ -z $firstport ]] && firstport=$(shuf -i 30000-50000 -n 1)
 
             if ! valid_port "$firstport"; then
                 red "起始端口必须是 1-65535 之间的数字！"
@@ -707,9 +707,9 @@ inst_port_config(){
         done
 
         while true; do
-            default_endport=$((firstport + 75))
+            default_endport=$((firstport + 1000))
             [[ $default_endport -gt 65535 ]] && default_endport=65535
-            read -rp "请输入结束端口 (回车默认为 起始端口+75 -> $default_endport): " endport
+            read -rp "请输入结束端口 (回车默认为 起始端口+1000 -> $default_endport): " endport
             [[ -z $endport ]] && endport=$default_endport
 
             if ! valid_port "$endport"; then
@@ -742,10 +742,10 @@ inst_port_config(){
         if [[ $hopTimeMode == 2 ]]; then
             hop_interval=""
             while true; do
-                read -rp "请输入最低跳跃时间秒数 [默认15]: " min_hop_interval
-                [[ -z $min_hop_interval ]] && min_hop_interval=15
-                read -rp "请输入最高跳跃时间秒数 [默认25]: " max_hop_interval
-                [[ -z $max_hop_interval ]] && max_hop_interval=25
+                read -rp "请输入最低跳跃时间秒数 [默认10]: " min_hop_interval
+                [[ -z $min_hop_interval ]] && min_hop_interval=10
+                read -rp "请输入最高跳跃时间秒数 [默认60]: " max_hop_interval
+                [[ -z $max_hop_interval ]] && max_hop_interval=60
 
                 if ! valid_hop_interval "$min_hop_interval"; then
                     red "最低跳跃时间必须是数字，且至少为 5 秒！"
@@ -770,8 +770,8 @@ inst_port_config(){
             min_hop_interval=""
             max_hop_interval=""
             while true; do
-                read -rp "请输入端口跳跃间隔秒数 [默认25]: " hop_interval
-                [[ -z $hop_interval ]] && hop_interval=25
+                read -rp "请输入端口跳跃间隔秒数 [默认30]: " hop_interval
+                [[ -z $hop_interval ]] && hop_interval=30
 
                 if ! valid_hop_interval "$hop_interval"; then
                     red "端口跳跃间隔必须是数字，且至少为 5 秒！"
@@ -983,12 +983,12 @@ transport:
 EOF
         if [[ -n $min_hop_interval && -n $max_hop_interval ]]; then
             cat << EOF >> /root/hy/hy-client.yaml
-    minHopInterval: ${min_hop_interval:-15}s
-    maxHopInterval: ${max_hop_interval:-25}s
+    minHopInterval: ${min_hop_interval:-10}s
+    maxHopInterval: ${max_hop_interval:-60}s
 EOF
         else
             cat << EOF >> /root/hy/hy-client.yaml
-    hopInterval: ${hop_interval:-25}s
+    hopInterval: ${hop_interval:-30}s
 EOF
         fi
     fi
@@ -1016,8 +1016,8 @@ EOF
   "transport": {
     "type": "udp",
     "udp": {
-      "minHopInterval": "${min_hop_interval:-15}s",
-      "maxHopInterval": "${max_hop_interval:-25}s"
+      "minHopInterval": "${min_hop_interval:-10}s",
+      "maxHopInterval": "${max_hop_interval:-60}s"
     }
   }
 }
@@ -1043,7 +1043,7 @@ EOF
   "transport": {
     "type": "udp",
     "udp": {
-      "hopInterval": "${hop_interval:-25}s"
+      "hopInterval": "${hop_interval:-30}s"
     }
   }
 }
@@ -1075,9 +1075,9 @@ EOF
     if [[ -n $firstport && -n $endport ]]; then
         # 端口跳跃模式
         if [[ -n $min_hop_interval && -n $max_hop_interval ]]; then
-            url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${min_hop_interval:-15}-${max_hop_interval:-25}&insecure=${insecure}&mport=${firstport}-${endport}&sni=${encoded_sni}#Hysteria2"
+            url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${min_hop_interval:-10}-${max_hop_interval:-60}&insecure=${insecure}&mport=${firstport}-${endport}&sni=${encoded_sni}#Hysteria2"
         else
-            url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${hop_interval:-25}&insecure=${insecure}&mport=${firstport}-${endport}&sni=${encoded_sni}#Hysteria2"
+            url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${hop_interval:-30}&insecure=${insecure}&mport=${firstport}-${endport}&sni=${encoded_sni}#Hysteria2"
         fi
     else
         # 单端口模式
@@ -1128,7 +1128,7 @@ read_current_config(){
         else
             hy_domain=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed 's/.*CN = //;s/,.*//' | sed 's/.*CN=//;s/,.*//')
             [[ -z $hy_domain ]] && hy_domain="www.bing.com"
-            hop_interval=25
+            hop_interval=30
             min_hop_interval=""
             max_hop_interval=""
             # 如果是 bing.com 则认为是自签证书
