@@ -28,6 +28,11 @@ IPTABLES_NAT_COMMENT="hy2-port-hop"
 IPTABLES_INPUT_COMMENT="hy2-udp-input"
 PORT_STATE_FILE="/etc/hysteria/port_state.conf"
 
+# 混淆（obfuscation）全局配置
+OBFS_ENABLED=0
+OBFS_TYPE="salamander"
+OBFS_PASSWORD=""
+
 # 脚本仓库地址（更新和 hy2 重装使用）
 REPO_URL="https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh"
 
@@ -143,7 +148,7 @@ json_escape() {
 
 # 生成更高复杂度的随机密码
 generate_password() {
-    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 32
+    LC_ALL=C tr -dc 'A-Za-z0-9!@#%^&*()_+-=' </dev/urandom 2>/dev/null | head -c 32
 }
 
 is_number() {
@@ -625,14 +630,24 @@ inst_cert(){
 
         green "已授予 Hysteria 读取证书文件的权限"
     else
-        green "将使用必应自签证书作为 Hysteria 2 的节点证书"
+        green "将使用自签证书作为 Hysteria 2 的节点证书"
+
+        # 常见域名池：避免单一 "www.bing.com" 成为 DPI 特征
+        CERT_DOMAINS=(
+            "www.bing.com"
+            "cdn.cloudflare.com"
+            "update.microsoft.com"
+            "dns.google"
+            "www.msn.com"
+            "a172-64.web.telemetry.microsoft.com"
+        )
+        hy_domain="${CERT_DOMAINS[$RANDOM % ${#CERT_DOMAINS[@]}]}"
 
         cert_path="/etc/hysteria/cert.crt"
         key_path="/etc/hysteria/private.key"
         openssl ecparam -genkey -name prime256v1 -out /etc/hysteria/private.key
-        openssl req -new -x509 -days 36500 -key /etc/hysteria/private.key -out /etc/hysteria/cert.crt -subj "/CN=www.bing.com"
-        hy_domain="www.bing.com"
-        domain="www.bing.com"
+        openssl req -new -x509 -days 36500 -key /etc/hysteria/private.key -out /etc/hysteria/cert.crt -subj "/CN=${hy_domain}"
+        domain=$hy_domain
         # 自签证书需要跳过验证
         insecure=1
     fi
@@ -864,6 +879,39 @@ inst_bandwidth(){
     fi
 }
 
+inst_obfs(){
+    echo ""
+    green "设置 QUIC 流量混淆 (Obfuscation) 模式："
+    echo -e " ${GREEN}1.${PLAIN} 启用 Salamander 混淆 ${YELLOW}（默认，强烈推荐）${PLAIN}"
+    echo -e "    ${PLAIN}说明：将 QUIC 包伪装成随机 UDP 流量，有效绕过 2026 年后的 QUIC 深度检测。"
+    echo -e "          ${YELLOW}注意：启用后服务不再兼容标准 HTTP/3 连接。${PLAIN}"
+    echo ""
+    echo -e " ${GREEN}2.${PLAIN} 不使用混淆"
+    echo -e "    ${PLAIN}说明：流量特征为标准 QUIC/HTTP3。如果线路不针对 QUIC 限速则速度更快，但隐蔽性较差。"
+    echo ""
+
+    read -rp "请输入选项 [1-2]（回车默认 1）: " obfsInput
+    [[ -z $obfsInput ]] && obfsInput=1
+
+    if [[ $obfsInput == 1 ]]; then
+        OBFS_ENABLED=1
+        OBFS_TYPE="salamander"
+        read -rp "设置混淆密码（回车跳过为随机字符）: " obfs_pwd_input
+        if [[ -z $obfs_pwd_input ]]; then
+            OBFS_PASSWORD=$(generate_password)
+        else
+            OBFS_PASSWORD=$obfs_pwd_input
+        fi
+        yellow "混淆密码：$OBFS_PASSWORD"
+        green "已启用 Salamander 混淆 (流量伪装为随机 UDP)"
+    else
+        OBFS_ENABLED=0
+        OBFS_TYPE=""
+        OBFS_PASSWORD=""
+        green "不启用混淆 (流量特征为标准 QUIC/HTTP3)"
+    fi
+}
+
 generate_config(){
     # 如果已有配置，改前备份
     if [[ -f /etc/hysteria/config.yaml ]]; then
@@ -897,6 +945,17 @@ auth:
   password: $yaml_auth_pwd
 
 EOF
+
+    if [[ $OBFS_ENABLED == 1 ]]; then
+        yaml_obfs_pwd=$(yaml_escape "$OBFS_PASSWORD")
+        cat << EOF >> /etc/hysteria/config.yaml
+obfs:
+  type: $OBFS_TYPE
+  $OBFS_TYPE:
+    password: $yaml_obfs_pwd
+
+EOF
+    fi
 
     if [[ $limit_bandwidth == "yes" ]]; then
         cat << EOF >> /etc/hysteria/config.yaml
@@ -957,11 +1016,14 @@ generate_client_config(){
     yaml_server=$(yaml_escape "$last_ip:$server_port_string")
     yaml_auth_pwd=$(yaml_escape "$auth_pwd")
     yaml_hy_domain=$(yaml_escape "$hy_domain")
+    yaml_obfs_pwd=$(yaml_escape "$OBFS_PASSWORD")
     json_server=$(json_escape "$last_ip:$server_port_string")
     json_auth_pwd=$(json_escape "$auth_pwd")
     json_hy_domain=$(json_escape "$hy_domain")
+    json_obfs_pwd=$(json_escape "$OBFS_PASSWORD")
     encoded_pwd=$(urlencode "$auth_pwd")
     encoded_sni=$(urlencode "$hy_domain")
+    encoded_obfs_pwd=$(urlencode "$OBFS_PASSWORD")
 
     # 生成 YAML 客户端配置
     cat << EOF > /root/hy/hy-client.yaml
@@ -972,12 +1034,33 @@ auth: $yaml_auth_pwd
 tls:
   sni: $yaml_hy_domain
   insecure: $insecure_bool
+EOF
+
+    if [[ $OBFS_ENABLED == 1 ]]; then
+        cat << EOF >> /root/hy/hy-client.yaml
+
+obfs:
+  type: $OBFS_TYPE
+  $OBFS_TYPE:
+    password: $yaml_obfs_pwd
+EOF
+    fi
+
+    cat << EOF >> /root/hy/hy-client.yaml
 
 quic:
   initStreamReceiveWindow: 8388608
   maxStreamReceiveWindow: 8388608
   initConnReceiveWindow: 20971520
   maxConnReceiveWindow: 20971520
+
+# ★ Hysteria 2 的速度核心：Brutal 拥塞控制
+# 请根据你的实际网速设置以下值（建议设为实际带宽的 70-80%）
+# 不设置则回退到标准 BBR，速度优势无法发挥
+# 示例：
+# bandwidth:
+#   up: 30 mbps
+#   down: 100 mbps
 
 fastOpen: true
 
@@ -1016,6 +1099,18 @@ EOF
     "sni": "$json_hy_domain",
     "insecure": $insecure_bool
   },
+EOF
+            if [[ $OBFS_ENABLED == 1 ]]; then
+                cat << EOF >> /root/hy/hy-client.json
+  "obfs": {
+    "type": "$OBFS_TYPE",
+    "$OBFS_TYPE": {
+      "password": "$json_obfs_pwd"
+    }
+  },
+EOF
+            fi
+            cat << EOF >> /root/hy/hy-client.json
   "quic": {
     "initStreamReceiveWindow": 8388608,
     "maxStreamReceiveWindow": 8388608,
@@ -1043,6 +1138,18 @@ EOF
     "sni": "$json_hy_domain",
     "insecure": $insecure_bool
   },
+EOF
+            if [[ $OBFS_ENABLED == 1 ]]; then
+                cat << EOF >> /root/hy/hy-client.json
+  "obfs": {
+    "type": "$OBFS_TYPE",
+    "$OBFS_TYPE": {
+      "password": "$json_obfs_pwd"
+    }
+  },
+EOF
+            fi
+            cat << EOF >> /root/hy/hy-client.json
   "quic": {
     "initStreamReceiveWindow": 8388608,
     "maxStreamReceiveWindow": 8388608,
@@ -1070,6 +1177,18 @@ EOF
     "sni": "$json_hy_domain",
     "insecure": $insecure_bool
   },
+EOF
+        if [[ $OBFS_ENABLED == 1 ]]; then
+            cat << EOF >> /root/hy/hy-client.json
+  "obfs": {
+    "type": "$OBFS_TYPE",
+    "$OBFS_TYPE": {
+      "password": "$json_obfs_pwd"
+    }
+  },
+EOF
+        fi
+        cat << EOF >> /root/hy/hy-client.json
   "quic": {
     "initStreamReceiveWindow": 8388608,
     "maxStreamReceiveWindow": 8388608,
@@ -1084,16 +1203,21 @@ EOF
     fi
 
     # 生成订阅链接 - 按照标准格式
+    obfs_url_part=""
+    if [[ $OBFS_ENABLED == 1 ]]; then
+        obfs_url_part="&obfs=$OBFS_TYPE&obfs-password=${encoded_obfs_pwd}"
+    fi
+
     if [[ -n $firstport && -n $endport ]]; then
         # 端口跳跃模式
         if [[ -n $min_hop_interval && -n $max_hop_interval ]]; then
-            url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${min_hop_interval:-10}-${max_hop_interval:-60}&insecure=${insecure}&mport=${firstport}-${endport}&sni=${encoded_sni}#Hysteria2"
+            url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${min_hop_interval:-10}-${max_hop_interval:-60}&insecure=${insecure}&mport=${firstport}-${endport}&sni=${encoded_sni}${obfs_url_part}#Hysteria2"
         else
-            url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${hop_interval:-30}&insecure=${insecure}&mport=${firstport}-${endport}&sni=${encoded_sni}#Hysteria2"
+            url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${hop_interval:-30}&insecure=${insecure}&mport=${firstport}-${endport}&sni=${encoded_sni}${obfs_url_part}#Hysteria2"
         fi
     else
         # 单端口模式
-        url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&insecure=${insecure}&sni=${encoded_sni}#Hysteria2"
+        url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&insecure=${insecure}&sni=${encoded_sni}${obfs_url_part}#Hysteria2"
     fi
 
     echo "$url" > /root/hy/url.txt
@@ -1106,6 +1230,24 @@ read_current_config(){
         cert_path=$(yaml_unescape "$(grep "^[[:space:]]*cert:" /etc/hysteria/config.yaml | sed 's/^[[:space:]]*cert:[[:space:]]*//')")
         key_path=$(yaml_unescape "$(grep "^[[:space:]]*key:" /etc/hysteria/config.yaml | sed 's/^[[:space:]]*key:[[:space:]]*//')")
         auth_pwd=$(yaml_unescape "$(grep "^[[:space:]]*password:" /etc/hysteria/config.yaml | sed 's/^[[:space:]]*password:[[:space:]]*//')")
+
+        # 解析混淆配置
+        obfs_type_line=$(grep "^obfs:" /etc/hysteria/config.yaml | head -1)
+        if [[ -n $obfs_type_line ]]; then
+            OBFS_ENABLED=1
+            obfs_type_sub=$(grep -A2 "^obfs:" /etc/hysteria/config.yaml | grep "type:" | head -1 | awk '{print $2}')
+            OBFS_TYPE="${obfs_type_sub:-salamander}"
+            # 读取子类型下的 password
+            if grep -q "^  $OBFS_TYPE:" /etc/hysteria/config.yaml 2>/dev/null; then
+                OBFS_PASSWORD=$(yaml_unescape "$(grep -A1 "^  $OBFS_TYPE:" /etc/hysteria/config.yaml | grep "password:" | sed 's/^[[:space:]]*password:[[:space:]]*//')")
+            else
+                OBFS_PASSWORD=""
+            fi
+        else
+            OBFS_ENABLED=0
+            OBFS_TYPE=""
+            OBFS_PASSWORD=""
+        fi
 
         if grep -q "type: proxy" /etc/hysteria/config.yaml; then
             masq_type="proxy"
@@ -1202,6 +1344,7 @@ insthysteria(){
     inst_cert
     inst_port_config
     inst_pwd
+    inst_obfs
     inst_site
     inst_bandwidth
     generate_config
@@ -1389,6 +1532,20 @@ changeproxysite(){
     green "Hysteria 2 节点伪装形式已修改成功！"
 }
 
+changeobfs(){
+    if ! read_current_config; then
+        red "未找到配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
+    inst_obfs
+    generate_config
+    generate_client_config
+    fix_permissions
+    stophysteria && starthysteria
+    green "Hysteria 2 混淆配置已更新！"
+    showconf
+}
+
 changeconf(){
     green "Hysteria 2 配置变更选择如下:"
     echo -e " ${GREEN}1.${PLAIN} 修改端口 (重新配置)"
@@ -1396,14 +1553,16 @@ changeconf(){
     echo -e " ${GREEN}3.${PLAIN} 修改证书类型"
     echo -e " ${GREEN}4.${PLAIN} 修改伪装形式"
     echo -e " ${GREEN}5.${PLAIN} 编辑带宽限速"
+    echo -e " ${GREEN}6.${PLAIN} 修改流量混淆 (Salamander) ${YELLOW}（新增）${PLAIN}"
     echo ""
-    read -rp " 请选择操作 [1-5]：" confAnswer
+    read -rp " 请选择操作 [1-6]：" confAnswer
     case $confAnswer in
         1 ) changeport ;;
         2 ) changepasswd ;;
         3 ) change_cert ;;
         4 ) changeproxysite ;;
         5 ) changebandwidth ;;
+        6 ) changeobfs ;;
         * ) exit 1 ;;
     esac
 }
@@ -1499,7 +1658,7 @@ case "$1" in
     --reinstall|-f)
         FORCE_INSTALL=1
         insthysteria
-        local rc=$?
+        rc=$?
         install_management_command
         exit $rc
         ;;
