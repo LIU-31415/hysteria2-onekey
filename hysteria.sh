@@ -158,12 +158,50 @@ valid_hop_interval() {
     is_number "$1" && (( 10#$1 >= 5 ))
 }
 
-is_udp_port_in_use() {
-    local check_port="$1"
-    if ! has_cmd ss; then
+# 获取所有 UDP 监听端口列表（优先 ss，netstat 兜底，都没有返回空）
+get_udp_ports() {
+    if has_cmd ss; then
+        ss -H -uln 2>/dev/null | awk '{print $5}' | sed 's/.*://g' | grep -E '^[0-9]+$' | sort -n | uniq
+    elif has_cmd netstat; then
+        netstat -uln 2>/dev/null | awk 'NR>2{print $4}' | sed 's/.*://g' | grep -E '^[0-9]+$' | sort -n | uniq
+    else
         return 1
     fi
-    ss -H -uln 2>/dev/null | awk '{print $5}' | sed 's/.*://g' | grep -w "$check_port" >/dev/null 2>&1
+}
+
+# 获取所有 TCP 监听端口列表（用于软提醒，UDP/TCP 不实际冲突）
+get_tcp_ports() {
+    if has_cmd ss; then
+        ss -H -tln 2>/dev/null | awk '{print $4}' | sed 's/.*://g' | grep -E '^[0-9]+$' | sort -n | uniq
+    elif has_cmd netstat; then
+        netstat -tln 2>/dev/null | awk 'NR>2{print $4}' | sed 's/.*://g' | grep -E '^[0-9]+$' | sort -n | uniq
+    else
+        return 1
+    fi
+}
+
+is_udp_port_in_use() {
+    local check_port="$1"
+    local used_ports
+    if ! used_ports=$(get_udp_ports); then
+        yellow "警告：未找到 ss/netstat，无法检测端口占用，请手动确认 UDP $check_port 未被占用。"
+        return 1
+    fi
+    [[ -z "$used_ports" ]] && return 1
+    grep -wq "$check_port" <<< "$used_ports" 2>/dev/null
+}
+
+# 软提醒：端口同时被 TCP 占用时提示（不阻塞，因为 UDP/TCP 不冲突）
+warn_if_tcp_in_use() {
+    local check_port="$1"
+    local tcp_ports
+    if ! tcp_ports=$(get_tcp_ports); then
+        return 0
+    fi
+    [[ -z "$tcp_ports" ]] && return 0
+    if grep -wq "$check_port" <<< "$tcp_ports" 2>/dev/null; then
+        yellow "提示：TCP $check_port 也被占用（UDP/TCP 不冲突，可继续；如感困惑可换其他 UDP 端口）。"
+    fi
 }
 
 check_udp_range_conflict() {
@@ -174,8 +212,9 @@ check_udp_range_conflict() {
     local used_ports=""
 
     # 一次性获取所有 UDP 监听端口列表，避免逐个端口调用 ss（1000 端口范围时性能提升显著）
-    if has_cmd ss; then
-        used_ports=$(ss -H -uln 2>/dev/null | awk '{print $5}' | sed 's/.*://g')
+    if ! used_ports=$(get_udp_ports); then
+        yellow "警告：未找到 ss/netstat，无法检测端口范围占用，请手动确认范围空闲。"
+        return 0
     fi
     [[ -z "$used_ports" ]] && return 0
 
@@ -193,6 +232,26 @@ check_udp_range_conflict() {
     fi
 
     return 0
+}
+
+# 进入端口配置前打印当前 UDP 占用情况，方便用户选端口
+show_udp_port_usage() {
+    local used_udp
+    if ! used_udp=$(get_udp_ports); then
+        yellow "提示：未找到 ss/netstat，无法列出已占用端口。"
+        return 0
+    fi
+    if [[ -z "$used_udp" ]]; then
+        green "当前无 UDP 端口被占用，可自由选择。"
+    else
+        local count
+        count=$(echo "$used_udp" | wc -l)
+        yellow "当前已占用 UDP 端口（共 $count 个）："
+        # 最多显示前 20 个，避免刷屏
+        echo "$used_udp" | head -20 | tr '\n' ' '
+        echo ""
+        [[ $count -gt 20 ]] && yellow "  ...及其他 $((count-20)) 个，详见 ss -uln"
+    fi
 }
 
 remove_rules_by_comment() {
@@ -264,6 +323,8 @@ ENDPORT='$endport'
 HOP_INTERVAL='$hop_interval'
 MIN_HOP_INTERVAL='$min_hop_interval'
 MAX_HOP_INTERVAL='$max_hop_interval'
+OBFS_TYPE='$obfs_type'
+OBFS_PASSWORD='$obfs_password'
 EOF
     chmod 600 "$PORT_STATE_FILE"
 }
@@ -278,6 +339,8 @@ load_port_state() {
         hop_interval="$HOP_INTERVAL"
         min_hop_interval="$MIN_HOP_INTERVAL"
         max_hop_interval="$MAX_HOP_INTERVAL"
+        obfs_type="$OBFS_TYPE"
+        obfs_password="$OBFS_PASSWORD"
         return 0
     fi
     return 1
@@ -459,14 +522,19 @@ install_management_command() {
 }
 
 realip(){
-    ip=$(curl -s4m8 https://ip.sb -k 2>/dev/null | tr -d '\r\n[:space:]')
-    if [[ -z $ip ]]; then
-        ip=$(curl -s6m8 https://ip.sb -k 2>/dev/null | tr -d '\r\n[:space:]')
-    fi
-    if [[ -z $ip ]]; then
-        red "无法获取服务器公网 IP，请检查网络。"
-        exit 1
-    fi
+    local url
+    # IPv4 优先，多源 fallback 提高可靠性
+    for url in "https://ip.sb" "https://api.ipify.org" "https://ifconfig.me"; do
+        ip=$(curl -s4m5 "$url" -k 2>/dev/null | tr -d '\r\n[:space:]')
+        [[ -n $ip ]] && return
+    done
+    # IPv6 兜底
+    for url in "https://ip.sb" "https://api6.ipify.org"; do
+        ip=$(curl -s6m5 "$url" -k 2>/dev/null | tr -d '\r\n[:space:]')
+        [[ -n $ip ]] && return
+    done
+    red "无法获取服务器公网 IP，请检查网络。"
+    exit 1
 }
 
 save_iptables_rules(){
@@ -511,13 +579,147 @@ fix_permissions(){
     fi
 }
 
+# 选择握手/伪装域名（推荐列表 + 自动测速 + 自定义）
+# 选最优握手域名的原则：
+#   1. 必须支持 HTTPS（TLS 握手特征要对得上）
+#   2. 最好支持 HTTP/3 (QUIC)，因为 Hysteria 2 就是 QUIC，流量特征更接近
+#   3. 国内可访问（否则 GFW 可能直接阻断该 SNI）
+#   4. 是 HTTPS 大站，不敏感
+#   5. 【关键】纯净度：与 AI/GitHub/Google 等敏感服务无关联，
+#      用这些域名做 SNI 不会暴露你真实访问意图（AI/代码托管等）。
+#      ❌ 绝对不要用 chat.openai.com / github.com / claude.ai / *.google.com 等
+#         这些域名要么国内不可达，要么是 GFW 重点监控对象，用作 SNI 反而暴露意图。
+select_sni() {
+    # 推荐域名列表：均为常规大站，与 AI/GitHub 等敏感服务无关联
+    # 字段：域名|HTTP/3|纯净度说明
+    local sni_list=(
+        "www.cloudflare.com|是|CDN基础设施，最纯净，与任何业务无关联，HTTP/3+全球CDN"
+        "www.apple.com|是|硬件厂商官网，纯净，与 AI/GitHub 无关联"
+        "www.microsoft.com|是|系统厂商官网，纯净，与 AI/GitHub 无关联"
+        "www.bing.com|否|搜索引擎，纯净，但无 HTTP/3（特征匹配度略低）"
+    )
+
+    echo ""
+    green "选择握手/伪装域名 (SNI)："
+    echo -e "    ${PLAIN}说明：握手域名用于 TLS 伪装，让流量看起来像在访问该大站。"
+    echo -e "    ${PLAIN}      选支持 HTTP/3 的大站效果最好（Hysteria 2 本身是 QUIC 协议）。"
+    echo -e "    ${GREEN}    ★ 所有推荐域名均为常规大站，与 AI/GitHub/Google 等敏感服务无关联，"
+    echo -e "      ${GREEN}不会暴露你真实的访问意图。${PLAIN}"
+    echo -e "    ${RED}    ✗ 切勿使用 chat.openai.com / github.com / claude.ai / *.google.com 等，"
+    echo -e "      ${RED}这些是 GFW 重点监控对象，用作 SNI 反而暴露意图。${PLAIN}"
+    echo ""
+    local i=1
+    for item in "${sni_list[@]}"; do
+        local domain="${item%%|*}"
+        local rest="${item#*|}"
+        local http3="${rest%%|*}"
+        local desc="${rest##*|}"
+        if [[ $i -eq 1 ]]; then
+            echo -e " ${GREEN}${i}.${PLAIN} ${domain} ${YELLOW}（默认，推荐）${PLAIN}"
+        else
+            echo -e " ${GREEN}${i}.${PLAIN} ${domain}"
+        fi
+        echo -e "    ${PLAIN}HTTP/3: ${http3} | ${desc}"
+        ((i++))
+    done
+    echo -e " ${GREEN}0.${PLAIN} 自动测速选最优 ${YELLOW}(检测各域名 HTTP/3 支持和延迟)${PLAIN}"
+    echo -e " ${GREEN}99.${PLAIN} 自定义输入"
+    echo ""
+    read -rp "请输入选项 [0-4/99]（回车默认 1）: " sniChoice
+    [[ -z $sniChoice ]] && sniChoice=1
+
+    local result=""
+    case $sniChoice in
+        0)
+            result=$(auto_test_sni "${sni_list[@]}")
+            ;;
+        99)
+            read -rp "请输入握手/伪装域名：" result
+            result=$(strip_url_scheme "$result")
+            [[ -z $result ]] && result="www.cloudflare.com"
+            ;;
+        [1-9])
+            local idx=$((sniChoice - 1))
+            if [[ $idx -lt ${#sni_list[@]} ]]; then
+                result="${sni_list[$idx]%%|*}"
+            else
+                result="www.cloudflare.com"
+            fi
+            ;;
+        *)
+            result="www.cloudflare.com"
+            ;;
+    esac
+
+    printf "%s" "$result"
+}
+
+# 自动测速：检测各候选域名的 HTTP/3 支持和 HTTPS 连通延迟，返回最优
+auto_test_sni() {
+    local candidates=("$@")
+    local best_domain=""
+    local best_score=-1
+    local domain http3 lat score
+
+    yellow "正在检测候选域名（HTTP/3 支持 + HTTPS 延迟）..."
+    printf "%-22s %-10s %-12s %s\n" "域名" "HTTP/3" "延迟(ms)" "评分"
+    printf "%-22s %-10s %-12s %s\n" "------" "------" "--------" "----"
+
+    for item in "${candidates[@]}"; do
+        # 列表格式：域名|HTTP/3|说明，只取第一段域名
+        domain="${item%%|*}"
+        http3="否"
+        lat="-"
+        score=0
+
+        # 检测 HTTP/3 支持（通过 alt-svc 头判断，无需 --http3 编译选项）
+        local alt_svc
+        alt_svc=$(curl -sI -m 5 "https://$domain" 2>/dev/null | grep -i "alt-svc:" | tr -d '\r')
+        if [[ $alt_svc == *h3* ]]; then
+            http3="是"
+            score=$((score + 50))
+        fi
+
+        # 检测 HTTPS 连通延迟（TLS 握手完成时间，含 TCP+TLS，比 time_connect 更准确）
+        local time_appconnect
+        time_appconnect=$(curl -so /dev/null -w "%{time_appconnect}" -m 5 "https://$domain" 2>/dev/null)
+        if [[ -n $time_appconnect && $time_appconnect != "0.000000" ]]; then
+            # 延迟越低分越高（100ms=100分，500ms=20分，>1000ms=0分）
+            local lat_ms
+            lat_ms=$(awk "BEGIN{printf \"%d\", $time_appconnect * 1000}")
+            lat="${lat_ms}ms"
+            score=$((score + $(awk "BEGIN{printf \"%d\", ($lat_ms < 1000) ? (1000 - $lat_ms) / 10 : 0}")))
+        else
+            # 连不通直接 0 分
+            score=0
+            lat="超时"
+        fi
+
+        printf "%-22s %-10s %-12s %s\n" "$domain" "$http3" "$lat" "$score"
+
+        if [[ $score -gt $best_score ]]; then
+            best_score=$score
+            best_domain=$domain
+        fi
+    done
+
+    echo ""
+    if [[ -z $best_domain || $best_score -le 0 ]]; then
+        yellow "检测失败或全部不通，使用默认 www.cloudflare.com"
+        printf "%s" "www.cloudflare.com"
+    else
+        green "最优握手域名：$best_domain（评分 $best_score）"
+        printf "%s" "$best_domain"
+    fi
+}
+
 inst_cert(){
     mkdir -p /etc/hysteria
 
     green "请选择 Hysteria 2 协议的证书申请方式："
     echo ""
 
-    echo -e " ${GREEN}1.${PLAIN} 使用自签证书 (伪装必应) ${YELLOW}（默认，推荐）${PLAIN}"
+    echo -e " ${GREEN}1.${PLAIN} 使用自签证书 ${YELLOW}（默认，推荐）${PLAIN}"
     echo -e "    ${PLAIN}说明：TLS 加密完整，流量特征与标准 HTTPS 无异。适合没有域名的场景。"
     echo ""
 
@@ -530,7 +732,8 @@ inst_cert(){
     echo -e "    ${PLAIN}说明：如果你已经拥有有效的证书文件 (crt/key)，请选择此项手动指定路径。"
     echo ""
 
-    read -rp "请输入选项 [1-3]: " certInput
+    read -rp "请输入选项 [1-3]（回车默认 1）: " certInput
+    [[ -z $certInput ]] && certInput=1
 
     if [[ $certInput == 2 ]]; then
         cert_path="/etc/hysteria/cert.crt"
@@ -625,16 +828,45 @@ inst_cert(){
 
         green "已授予 Hysteria 读取证书文件的权限"
     else
-        green "将使用必应自签证书作为 Hysteria 2 的节点证书"
+        green "将使用自签证书作为 Hysteria 2 的节点证书"
 
         cert_path="/etc/hysteria/cert.crt"
         key_path="/etc/hysteria/private.key"
-        openssl ecparam -genkey -name prime256v1 -out /etc/hysteria/private.key
-        openssl req -new -x509 -days 36500 -key /etc/hysteria/private.key -out /etc/hysteria/cert.crt -subj "/CN=www.bing.com"
-        hy_domain="www.bing.com"
-        domain="www.bing.com"
+
+        # 选择握手/伪装域名（推荐列表，默认 cloudflare）
+        custom_sni=$(select_sni)
+
+        # 选择证书算法
+        echo ""
+        green "选择自签证书加密算法："
+        echo -e " ${GREEN}1.${PLAIN} Ed25519 ${YELLOW}（默认，推荐）${PLAIN}"
+        echo -e "    ${PLAIN}说明：现代椭圆曲线，密钥短、握手快、CPU 占用最低、强度高（256 位安全级）。"
+        echo -e " ${GREEN}2.${PLAIN} prime256v1 (NIST P-256)"
+        echo -e "    ${PLAIN}说明：兼容性最广，旧客户端/老内核支持更好（128 位安全级）。"
+        echo -e " ${GREEN}3.${PLAIN} secp384r1 (NIST P-384)"
+        echo -e "    ${PLAIN}说明：强度更高（192 位安全级），但握手和加解密稍慢，适合极端安全需求。"
+        echo ""
+        read -rp "请输入选项 [1-3]（回车默认 1）: " certAlgoInput
+        [[ -z $certAlgoInput ]] && certAlgoInput=1
+
+        if [[ $certAlgoInput == 2 ]]; then
+            cert_algo="prime256v1"
+            openssl ecparam -genkey -name prime256v1 -out "$key_path"
+        elif [[ $certAlgoInput == 3 ]]; then
+            cert_algo="secp384r1"
+            openssl ecparam -genkey -name secp384r1 -out "$key_path"
+        else
+            cert_algo="Ed25519"
+            openssl genpkey -algorithm Ed25519 -out "$key_path"
+        fi
+
+        openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=$custom_sni"
+
+        hy_domain="$custom_sni"
+        domain="$custom_sni"
         # 自签证书需要跳过验证
         insecure=1
+        yellow "自签证书已生成（$cert_algo），握手/伪装域名：$custom_sni"
     fi
 }
 
@@ -647,7 +879,13 @@ inst_port_config(){
     echo -e "    ${PLAIN}说明：自动在多个端口间切换，有效对抗运营商针对性阻断和限速，连接更稳。"
     echo -e " ${GREEN}2.${PLAIN} 单端口模式 ${YELLOW}（默认，推荐）${PLAIN}"
     echo ""
-    read -rp "请输入选项 [1-2]: " portMode
+    read -rp "请输入选项 [1-2]（回车默认 2）: " portMode
+    [[ -z $portMode ]] && portMode=2
+
+    # 进入端口输入前，展示当前 UDP 占用情况，方便用户选端口
+    echo ""
+    show_udp_port_usage
+    echo ""
 
     if [[ $portMode == 2 ]]; then
         while true; do
@@ -661,9 +899,12 @@ inst_port_config(){
             port=$((10#$port))
 
             if is_udp_port_in_use "$port"; then
-                echo -e "${RED} $port ${PLAIN} 端口已被占用，请更换！"
+                echo -e "${RED} $port ${PLAIN} UDP 端口已被占用，请更换！"
                 continue
             fi
+
+            # TCP 软提醒（不阻塞，UDP/TCP 不实际冲突）
+            warn_if_tcp_in_use "$port"
 
             break
         done
@@ -704,9 +945,12 @@ inst_port_config(){
             fi
 
             if is_udp_port_in_use "$firstport"; then
-                echo -e "${RED} $firstport ${PLAIN} 端口已被占用，请更换！"
+                echo -e "${RED} $firstport ${PLAIN} UDP 端口已被占用，请更换！"
                 continue
             fi
+
+            # TCP 软提醒
+            warn_if_tcp_in_use "$firstport"
 
             break
         done
@@ -742,7 +986,8 @@ inst_port_config(){
         echo -e " ${GREEN}2.${PLAIN} 随机跳跃时间"
         echo -e "    ${YELLOW}注意：低版本的代理软件可能不支持随机跳跃时间，Xray 内核系列可能不支持。${PLAIN}"
         echo ""
-        read -rp "请输入选项 [1-2]: " hopTimeMode
+        read -rp "请输入选项 [1-2]（回车默认 1）: " hopTimeMode
+        [[ -z $hopTimeMode ]] && hopTimeMode=1
 
         if [[ $hopTimeMode == 2 ]]; then
             hop_interval=""
@@ -826,7 +1071,8 @@ inst_site(){
     echo -e "    ${PLAIN}说明：反代目标网站。${RED}不推荐！会消耗额外 CPU/带宽，容易被识别为跳板攻击，伪装效果往往不如静态页面。${PLAIN}"
     echo ""
 
-    read -rp "请输入选项 [1-2]: " masqInput
+    read -rp "请输入选项 [1-2]（回车默认 1）: " masqInput
+    [[ -z $masqInput ]] && masqInput=1
 
     if [[ $masqInput == 2 ]]; then
         masq_type="proxy"
@@ -864,6 +1110,32 @@ inst_bandwidth(){
     fi
 }
 
+# 混淆加密配置（默认开启 Salamander，对新人零配置）
+inst_obfs(){
+    echo ""
+    green "设置流量混淆加密 (抗识别/抗 QoS 限速)："
+    echo -e " ${GREEN}1.${PLAIN} 开启 Salamander 混淆加密 ${YELLOW}（默认，强烈推荐）${PLAIN}"
+    echo -e "    ${PLAIN}说明：在 QUIC/TLS 加密基础上，对 QUIC 包头再做一层 AES-CTR 流加密，"
+    echo -e "    ${PLAIN}      ${GREEN}运营商完全看不出这是 QUIC 流量${PLAIN}，表现为完全随机 UDP 包，抗识别/抗封锁。"
+    echo -e " ${GREEN}2.${PLAIN} 关闭混淆"
+    echo -e "    ${PLAIN}说明：仅 QUIC 原生 TLS，若运营商不做深包检测时可关闭，性能差异可忽略。"
+    echo ""
+
+    read -rp "请输入选项 [1-2]（回车默认 1）: " obfsInput
+    [[ -z $obfsInput ]] && obfsInput=1
+
+    if [[ $obfsInput == 1 ]]; then
+        obfs_type="salamander"
+        read -rp "设置混淆密钥（回车自动生成）：" obfs_password
+        [[ -z $obfs_password ]] && obfs_password=$(generate_password)
+        yellow "混淆加密已开启，密钥：$obfs_password"
+    else
+        obfs_type=""
+        obfs_password=""
+        yellow "未开启混淆加密（仅 QUIC 原生 TLS 加密）"
+    fi
+}
+
 generate_config(){
     # 如果已有配置，改前备份
     if [[ -f /etc/hysteria/config.yaml ]]; then
@@ -878,6 +1150,7 @@ generate_config(){
     yaml_key_path=$(yaml_escape "$key_path")
     yaml_auth_pwd=$(yaml_escape "$auth_pwd")
     yaml_proxy_url=$(yaml_escape "https://$proxysite")
+    yaml_obfs_password=$(yaml_escape "$obfs_password")
 
     cat << EOF > /etc/hysteria/config.yaml
 listen: :$port
@@ -885,18 +1158,36 @@ listen: :$port
 tls:
   cert: $yaml_cert_path
   key: $yaml_key_path
+  minVersion: tls1.3
+  alpn:
+    - h3
+    - h2
+    - http/1.1
 
 quic:
   initStreamReceiveWindow: 8388608
   maxStreamReceiveWindow: 8388608
   initConnReceiveWindow: 20971520
   maxConnReceiveWindow: 20971520
+  maxIdleTimeout: 30s
+  keepAlivePeriod: 10s
+  disablePathMTUDiscovery: false
 
 auth:
   type: password
   password: $yaml_auth_pwd
 
 EOF
+
+    if [[ -n $obfs_type && -n $obfs_password ]]; then
+        cat << EOF >> /etc/hysteria/config.yaml
+obfs:
+  type: $obfs_type
+  salamander:
+    password: $yaml_obfs_password
+
+EOF
+    fi
 
     if [[ $limit_bandwidth == "yes" ]]; then
         cat << EOF >> /etc/hysteria/config.yaml
@@ -957,11 +1248,14 @@ generate_client_config(){
     yaml_server=$(yaml_escape "$last_ip:$server_port_string")
     yaml_auth_pwd=$(yaml_escape "$auth_pwd")
     yaml_hy_domain=$(yaml_escape "$hy_domain")
+    yaml_obfs_password=$(yaml_escape "$obfs_password")
     json_server=$(json_escape "$last_ip:$server_port_string")
     json_auth_pwd=$(json_escape "$auth_pwd")
     json_hy_domain=$(json_escape "$hy_domain")
+    json_obfs_password=$(json_escape "$obfs_password")
     encoded_pwd=$(urlencode "$auth_pwd")
     encoded_sni=$(urlencode "$hy_domain")
+    encoded_obfs=$(urlencode "$obfs_password")
 
     # 生成 YAML 客户端配置
     cat << EOF > /root/hy/hy-client.yaml
@@ -972,12 +1266,18 @@ auth: $yaml_auth_pwd
 tls:
   sni: $yaml_hy_domain
   insecure: $insecure_bool
+  alpn:
+    - h3
+    - h2
+    - http/1.1
 
 quic:
   initStreamReceiveWindow: 8388608
   maxStreamReceiveWindow: 8388608
   initConnReceiveWindow: 20971520
   maxConnReceiveWindow: 20971520
+  maxIdleTimeout: 30s
+  keepAlivePeriod: 10s
 
 fastOpen: true
 
@@ -985,6 +1285,17 @@ socks5:
   listen: 127.0.0.1:5678
 
 EOF
+
+    # 混淆加密配置
+    if [[ -n $obfs_type && -n $obfs_password ]]; then
+        cat << EOF >> /root/hy/hy-client.yaml
+obfs:
+  type: $obfs_type
+  salamander:
+    password: $yaml_obfs_password
+
+EOF
+    fi
 
     # 仅在端口跳跃模式下添加 transport 配置
     if [[ -n $firstport && -n $endport ]]; then
@@ -1005,96 +1316,58 @@ EOF
         fi
     fi
 
-    # 生成 JSON 配置
+    # 生成 JSON 配置（用变量构建 transport 和 obfs 字段）
+    json_transport=""
     if [[ -n $firstport && -n $endport ]]; then
         if [[ -n $min_hop_interval && -n $max_hop_interval ]]; then
-            cat << EOF > /root/hy/hy-client.json
-{
-  "server": "$json_server",
-  "auth": "$json_auth_pwd",
-  "tls": {
-    "sni": "$json_hy_domain",
-    "insecure": $insecure_bool
-  },
-  "quic": {
-    "initStreamReceiveWindow": 8388608,
-    "maxStreamReceiveWindow": 8388608,
-    "initConnReceiveWindow": 20971520,
-    "maxConnReceiveWindow": 20971520
-  },
-  "socks5": {
-    "listen": "127.0.0.1:5678"
-  },
-  "transport": {
-    "type": "udp",
-    "udp": {
-      "minHopInterval": "${min_hop_interval:-10}s",
-      "maxHopInterval": "${max_hop_interval:-60}s"
-    }
-  }
-}
-EOF
+            json_transport=',"transport":{"type":"udp","udp":{"minHopInterval":"'"${min_hop_interval:-10}"'s","maxHopInterval":"'"${max_hop_interval:-60}"'s"}}'
         else
-            cat << EOF > /root/hy/hy-client.json
-{
-  "server": "$json_server",
-  "auth": "$json_auth_pwd",
-  "tls": {
-    "sni": "$json_hy_domain",
-    "insecure": $insecure_bool
-  },
-  "quic": {
-    "initStreamReceiveWindow": 8388608,
-    "maxStreamReceiveWindow": 8388608,
-    "initConnReceiveWindow": 20971520,
-    "maxConnReceiveWindow": 20971520
-  },
-  "socks5": {
-    "listen": "127.0.0.1:5678"
-  },
-  "transport": {
-    "type": "udp",
-    "udp": {
-      "hopInterval": "${hop_interval:-30}s"
-    }
-  }
-}
-EOF
+            json_transport=',"transport":{"type":"udp","udp":{"hopInterval":"'"${hop_interval:-30}"'s"}}'
         fi
-    else
-        cat << EOF > /root/hy/hy-client.json
-{
-  "server": "$json_server",
-  "auth": "$json_auth_pwd",
-  "tls": {
-    "sni": "$json_hy_domain",
-    "insecure": $insecure_bool
-  },
-  "quic": {
-    "initStreamReceiveWindow": 8388608,
-    "maxStreamReceiveWindow": 8388608,
-    "initConnReceiveWindow": 20971520,
-    "maxConnReceiveWindow": 20971520
-  },
-  "socks5": {
-    "listen": "127.0.0.1:5678"
-  }
-}
-EOF
     fi
 
-    # 生成订阅链接 - 按照标准格式
-    if [[ -n $firstport && -n $endport ]]; then
-        # 端口跳跃模式
-        if [[ -n $min_hop_interval && -n $max_hop_interval ]]; then
-            url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${min_hop_interval:-10}-${max_hop_interval:-60}&insecure=${insecure}&mport=${firstport}-${endport}&sni=${encoded_sni}#Hysteria2"
-        else
-            url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${hop_interval:-30}&insecure=${insecure}&mport=${firstport}-${endport}&sni=${encoded_sni}#Hysteria2"
-        fi
-    else
-        # 单端口模式
-        url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&insecure=${insecure}&sni=${encoded_sni}#Hysteria2"
+    json_obfs=""
+    if [[ -n $obfs_type && -n $obfs_password ]]; then
+        json_obfs=',"obfs":{"type":"'"$obfs_type"'","salamander":{"password":"'"$json_obfs_password"'"}}'
     fi
+
+    cat << EOF > /root/hy/hy-client.json
+{
+  "server": "$json_server",
+  "auth": "$json_auth_pwd",
+  "tls": {
+    "sni": "$json_hy_domain",
+    "insecure": $insecure_bool,
+    "alpn": ["h3","h2","http/1.1"]
+  },
+  "quic": {
+    "initStreamReceiveWindow": 8388608,
+    "maxStreamReceiveWindow": 8388608,
+    "initConnReceiveWindow": 20971520,
+    "maxConnReceiveWindow": 20971520,
+    "maxIdleTimeout": "30s",
+    "keepAlivePeriod": "10s"
+  },
+  "fastOpen": true,
+  "socks5": {
+    "listen": "127.0.0.1:5678"
+  }$json_obfs$json_transport
+}
+EOF
+
+    # 生成订阅链接 - 按照标准格式（含 obfs 参数）
+    local url_params="security=tls&insecure=${insecure}&sni=${encoded_sni}"
+    if [[ -n $obfs_type && -n $obfs_password ]]; then
+        url_params="${url_params}&obfs=${obfs_type}&obfsParam=${encoded_obfs}"
+    fi
+    if [[ -n $firstport && -n $endport ]]; then
+        if [[ -n $min_hop_interval && -n $max_hop_interval ]]; then
+            url_params="${url_params}&mportHopInt=${min_hop_interval:-10}-${max_hop_interval:-60}&mport=${firstport}-${endport}"
+        else
+            url_params="${url_params}&mportHopInt=${hop_interval:-30}&mport=${firstport}-${endport}"
+        fi
+    fi
+    url="hysteria2://${encoded_pwd}@${last_ip}:${port}?${url_params}#Hysteria2"
 
     echo "$url" > /root/hy/url.txt
 }
@@ -1124,6 +1397,18 @@ read_current_config(){
             bandwidth_value=""
         fi
 
+        # 读取 obfs 混淆设置（必须限定在 obfs: 块内匹配，避免误读 auth.type / masquerade.type）
+        if grep -q "^obfs:" /etc/hysteria/config.yaml; then
+            # 用 awk 提取 obfs: 块的内容（从 ^obfs: 到下一个顶层 key 或文件末尾）
+            local obfs_block
+            obfs_block=$(awk '/^obfs:/{f=1;next} /^[a-zA-Z]/{f=0} f' /etc/hysteria/config.yaml)
+            obfs_type=$(echo "$obfs_block" | grep "^[[:space:]]*type:" | awk '{print $2}')
+            obfs_password=$(yaml_unescape "$(echo "$obfs_block" | grep "^[[:space:]]*password:" | sed 's/^[[:space:]]*password:[[:space:]]*//')")
+        else
+            obfs_type=""
+            obfs_password=""
+        fi
+
         if [[ -f /root/hy/hy-client.yaml ]]; then
             hy_domain=$(yaml_unescape "$(grep "^[[:space:]]*sni:" /root/hy/hy-client.yaml | sed 's/^[[:space:]]*sni:[[:space:]]*//')")
             # 读取跳跃间隔
@@ -1139,19 +1424,24 @@ read_current_config(){
             fi
         else
             hy_domain=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed 's/.*CN = //;s/,.*//' | sed 's/.*CN=//;s/,.*//')
-            [[ -z $hy_domain ]] && hy_domain="www.bing.com"
+            [[ -z $hy_domain ]] && hy_domain="www.cloudflare.com"
             hop_interval=30
             min_hop_interval=""
             max_hop_interval=""
-            # 如果是 bing.com 则认为是自签证书
-            if [[ $hy_domain == "www.bing.com" ]]; then
+            # 通过 issuer==subject 判断自签证书（自签证书的颁发者=持有者）
+            # 不再依赖域名判断，SNI 改成什么都能正确识别自签证书
+            # 注意：openssl 输出带 "issuer=" / "subject=" 前缀，需去掉前缀再比较
+            local cert_issuer cert_subject
+            cert_issuer=$(openssl x509 -in "$cert_path" -noout -issuer 2>/dev/null | sed 's/^[a-zA-Z]*=//')
+            cert_subject=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed 's/^[a-zA-Z]*=//')
+            if [[ -n $cert_issuer && -n $cert_subject && $cert_issuer == "$cert_subject" ]]; then
                 insecure=1
             else
                 insecure=0
             fi
         fi
 
-        # 优先读取脚本自己的端口状态文件，避免误读系统里其他服务的 iptables 规则。
+        # 优先读取脚本自己的端口状态文件（含 obfs 保存字段）
         if ! load_port_state; then
             port_hop_rule=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -F "$IPTABLES_NAT_COMMENT" | head -n 1)
             port_range=$(echo "$port_hop_rule" | sed -nE 's/.*--dport ([0-9]+):([0-9]+).*/\1:\2/p')
@@ -1204,6 +1494,7 @@ insthysteria(){
     inst_pwd
     inst_site
     inst_bandwidth
+    inst_obfs
     generate_config
     generate_client_config
 
@@ -1212,17 +1503,25 @@ insthysteria(){
     systemctl daemon-reload
     systemctl enable hysteria-server
 
-    echo "正在等待网络环境就绪..."
-    sleep 5
+    echo "正在启动 Hysteria 2 服务..."
     systemctl start hysteria-server
 
-    sleep 2
-    if systemctl is-active --quiet hysteria-server && [[ -f '/etc/hysteria/config.yaml' ]]; then
+    # 轮询等待服务就绪（最长 10 秒），比固定 sleep 更快
+    local wait_ok=0
+    for _ in {1..10}; do
+        if systemctl is-active --quiet hysteria-server && [[ -f '/etc/hysteria/config.yaml' ]]; then
+            wait_ok=1
+            break
+        fi
+        sleep 1
+    done
+
+    if [[ $wait_ok -eq 1 ]]; then
         green "Hysteria 2 服务启动成功"
     else
         red "Hysteria 2 服务启动失败，请检查日志：journalctl -u hysteria-server -e" && exit 1
     fi
-    red "======================================================================================"
+    green "======================================================================================"
     green "Hysteria 2 代理服务安装完成"
 
     green "======================================================================================"
@@ -1249,6 +1548,8 @@ unsthysteria(){
     rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service
     rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy /root/hysteria.sh
     rm -f /usr/bin/hy2 /usr/local/bin/hy2-fix-cert-perms /etc/letsencrypt/renewal-hooks/deploy/hy2-fix-cert-perms
+    # 清理 acme.sh 的 crontab 条目（安装时添加到 /etc/crontab）
+    sed -i '/acme\.sh --cron/d' /etc/crontab 2>/dev/null || true
     remove_hy2_iptables_rules
     save_iptables_rules
     systemctl daemon-reload
@@ -1284,7 +1585,7 @@ hysteriaswitch(){
         1 ) starthysteria ;;
         2 ) stophysteria ;;
         3 ) stophysteria && starthysteria ;;
-        * ) exit 1 ;;
+        * ) yellow "无效选项，请重新运行脚本" ;;
     esac
 }
 
@@ -1377,6 +1678,68 @@ change_cert(){
     showconf
 }
 
+# 修改握手/伪装域名（仅适用于自签证书模式）
+change_sni(){
+    if ! read_current_config; then
+        red "未找到配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
+
+    yellow "当前握手域名：$hy_domain"
+    yellow "注意：此功能仅适用于自签证书模式，将重新生成自签证书。"
+    yellow "      如果你当前使用 ACME/自定义证书，请使用「修改证书类型」切换。"
+    echo ""
+
+    local new_sni
+    new_sni=$(select_sni)
+
+    if [[ $new_sni == "$hy_domain" ]]; then
+        yellow "新域名与当前域名相同，已取消。"
+        return 0
+    fi
+
+    # 重新生成自签证书（保持原有算法，默认 Ed25519）
+    cert_path="/etc/hysteria/cert.crt"
+    key_path="/etc/hysteria/private.key"
+    mkdir -p /etc/hysteria
+
+    # 检测现有证书算法，尽量保持一致
+    # 统一用 openssl pkey 读取私钥信息（兼容 EC / Ed25519 / RSA）
+    local existing_algo=""
+    if [[ -f "$key_path" ]]; then
+        local key_text
+        key_text=$(openssl pkey -in "$key_path" -noout -text 2>/dev/null)
+        if echo "$key_text" | grep -q "ED25519"; then
+            existing_algo="Ed25519"
+        elif echo "$key_text" | grep -q "ASN1 OID: prime256v1"; then
+            existing_algo="prime256v1"
+        elif echo "$key_text" | grep -q "ASN1 OID: secp384r1"; then
+            existing_algo="secp384r1"
+        fi
+    fi
+    local use_algo="${existing_algo:-Ed25519}"
+
+    if [[ $use_algo == "prime256v1" ]]; then
+        openssl ecparam -genkey -name prime256v1 -out "$key_path"
+    elif [[ $use_algo == "secp384r1" ]]; then
+        openssl ecparam -genkey -name secp384r1 -out "$key_path"
+    else
+        openssl genpkey -algorithm Ed25519 -out "$key_path"
+    fi
+    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=$new_sni"
+
+    hy_domain="$new_sni"
+    domain="$new_sni"
+    insecure=1
+
+    generate_config
+    generate_client_config
+    fix_permissions
+    stophysteria && starthysteria
+    green "握手/伪装域名已修改为：$new_sni（证书算法：$use_algo）"
+    showconf
+}
+
 changeproxysite(){
     if ! read_current_config; then
         red "未找到配置文件，请先安装 Hysteria 2"
@@ -1389,6 +1752,26 @@ changeproxysite(){
     green "Hysteria 2 节点伪装形式已修改成功！"
 }
 
+change_obfs(){
+    if ! read_current_config; then
+        red "未找到配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
+    if [[ -n $obfs_type ]]; then
+        yellow "当前混淆加密：已开启 ($obfs_type)"
+    else
+        yellow "当前混淆加密：未开启（仅 QUIC 原生 TLS 加密）"
+    fi
+    inst_obfs
+    save_port_state
+    generate_config
+    generate_client_config
+    fix_permissions
+    stophysteria && starthysteria
+    green "混淆加密设置已更新！"
+    showconf
+}
+
 changeconf(){
     green "Hysteria 2 配置变更选择如下:"
     echo -e " ${GREEN}1.${PLAIN} 修改端口 (重新配置)"
@@ -1396,15 +1779,19 @@ changeconf(){
     echo -e " ${GREEN}3.${PLAIN} 修改证书类型"
     echo -e " ${GREEN}4.${PLAIN} 修改伪装形式"
     echo -e " ${GREEN}5.${PLAIN} 编辑带宽限速"
+    echo -e " ${GREEN}6.${PLAIN} 修改握手域名 ${YELLOW}(仅自签证书)${PLAIN}"
+    echo -e " ${GREEN}7.${PLAIN} 修改混淆加密 ${YELLOW}(传输层再加密/抗识别)${PLAIN}"
     echo ""
-    read -rp " 请选择操作 [1-5]：" confAnswer
+    read -rp " 请选择操作 [1-7]：" confAnswer
     case $confAnswer in
         1 ) changeport ;;
         2 ) changepasswd ;;
         3 ) change_cert ;;
         4 ) changeproxysite ;;
         5 ) changebandwidth ;;
-        * ) exit 1 ;;
+        6 ) change_sni ;;
+        7 ) change_obfs ;;
+        * ) yellow "无效选项，请重新运行脚本" ;;
     esac
 }
 
@@ -1426,6 +1813,22 @@ menu() {
     echo "#############################################################"
     echo -e "#                  ${GREEN}Hysteria 2 一键安装脚本${PLAIN}                  #"
     echo "#############################################################"
+
+    # 状态栏：显示运行状态、端口、核心版本（已安装时）
+    if [[ -f /etc/hysteria/config.yaml ]]; then
+        local status port_info version_info
+        if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+            status="${GREEN}● 运行中${PLAIN}"
+        else
+            status="${RED}○ 未运行${PLAIN}"
+        fi
+        port_info=$(grep "^listen:" /etc/hysteria/config.yaml 2>/dev/null | sed 's/^listen:[[:space:]]*//')
+        version_info=$(hysteria version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        echo -e "#  状态: $status | 端口: ${port_info:-未知} | 核心: ${version_info:-未知}"
+    else
+        echo -e "#  状态: ${YELLOW}未安装${PLAIN}"
+    fi
+    echo "#############################################################"
     echo ""
     echo -e " ${GREEN}1.${PLAIN} ${GREEN}安装 Hysteria 2${PLAIN}"
     echo -e " ${RED}2.${PLAIN} ${RED}卸载 Hysteria 2${PLAIN}"
@@ -1433,21 +1836,62 @@ menu() {
     echo -e " 3. 关闭、开启、重启 Hysteria 2"
     echo -e " 4. 修改 Hysteria 2 配置"
     echo -e " 5. 显示 Hysteria 2 配置文件"
-    echo -e " 6. 更新脚本"
+    echo -e " 6. 更新 Hysteria 2 核心"
+    echo -e " 7. 更新脚本"
     echo " ------------------------------------------------------------"
     echo -e " 0. 退出脚本"
     echo ""
-    read -rp "请输入选项 [0-6]: " menuInput
+    read -rp "请输入选项 [0-7]: " menuInput
     case $menuInput in
         1 ) insthysteria ;;
         2 ) unsthysteria ;;
         3 ) hysteriaswitch ;;
         4 ) changeconf ;;
         5 ) showconf ;;
-        6 ) update_script ;;
+        6 ) update_core ;;
+        7 ) update_script ;;
         0 ) exit 0 ;;
-        * ) exit 1 ;;
+        * ) yellow "无效选项，请重新运行脚本" ;;
     esac
+}
+
+# 更新 Hysteria 2 核心
+update_core() {
+    if [[ ! -f /usr/local/bin/hysteria ]]; then
+        red "未检测到 Hysteria 2 核心，请先安装。"
+        return 1
+    fi
+
+    local old_version
+    old_version=$(hysteria version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    yellow "当前 Hysteria 2 核心版本：${old_version:-未知}"
+    echo ""
+    read -rp "确认更新核心？(y/N): " confirm
+    [[ $confirm != "y" && $confirm != "Y" ]] && yellow "已取消" && return 0
+
+    yellow "正在更新 Hysteria 2 核心..."
+    systemctl stop hysteria-server >/dev/null 2>&1
+
+    bash <(curl -fsSL https://get.hy2.sh/)
+
+    if [[ ! -f /usr/local/bin/hysteria ]]; then
+        red "Hysteria 2 核心更新失败！"
+        systemctl start hysteria-server >/dev/null 2>&1
+        return 1
+    fi
+
+    systemctl start hysteria-server
+
+    local new_version
+    new_version=$(hysteria version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+
+    if systemctl is-active --quiet hysteria-server; then
+        green "Hysteria 2 核心更新成功！"
+        green "版本变化：${old_version:-未知} → ${new_version:-未知}"
+    else
+        red "更新后启动失败，请查看日志：journalctl -u hysteria-server -e"
+        return 1
+    fi
 }
 
 # 更新脚本
@@ -1499,7 +1943,7 @@ case "$1" in
     --reinstall|-f)
         FORCE_INSTALL=1
         insthysteria
-        local rc=$?
+        rc=$?
         install_management_command
         exit $rc
         ;;
