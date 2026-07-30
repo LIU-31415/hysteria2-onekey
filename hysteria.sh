@@ -610,7 +610,6 @@ inst_cert(){
     elif [[ $certInput == 3 ]]; then
         read -rp "请输入公钥文件 crt 的路径：" cert_path
         read -rp "请输入密钥文件 key 的路径：" key_path
-        read -rp "请输入证书的域名：" domain
 
         if [[ ! -f $cert_path ]]; then
             red "证书文件不存在：$cert_path"
@@ -620,6 +619,14 @@ inst_cert(){
             red "密钥文件不存在：$key_path"
             exit 1
         fi
+
+        # 自动从证书提取域名
+        domain=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed 's/.*CN = //;s/,.*//' | sed 's/.*CN=//;s/,.*//')
+        if [[ -z $domain ]]; then
+            red "无法从证书中提取域名，请确认证书文件有效"
+            exit 1
+        fi
+        green "从证书中读取到域名：$domain"
 
         # 不搬运、不复制证书：只对用户提供的原始证书路径授予 Hysteria 读取权限。
         grant_cert_read_permissions "$cert_path" "$key_path"
