@@ -522,8 +522,9 @@ inst_cert(){
     green "请选择 Hysteria 2 协议的证书申请方式："
     echo ""
 
-    echo -e " ${GREEN}1.${PLAIN} 使用自签证书 (伪装必应) ${YELLOW}（默认，推荐）${PLAIN}"
-    echo -e "    ${PLAIN}说明：TLS 加密完整，流量特征与标准 HTTPS 无异。适合没有域名的场景。"
+    echo -e " ${GREEN}1.${PLAIN} 使用自签证书 ${YELLOW}（默认，推荐）${PLAIN}"
+    echo -e "    ${PLAIN}说明：TLS 加密完整，流量特征与标准 HTTPS 无异。证书域名从通用域名池随机选取，规避固定域名特征。"
+    echo -e "          ${YELLOW}注意：自签证书未被 CA 信任，客户端需设置 insecure: true。${PLAIN}"
     echo ""
 
     echo -e " ${GREEN}2.${PLAIN} 使用 ACME 脚本自动申请证书"
@@ -630,7 +631,7 @@ inst_cert(){
 
         green "已授予 Hysteria 读取证书文件的权限"
     else
-        green "将使用自签证书作为 Hysteria 2 的节点证书"
+        green "将使用自签证书作为 Hysteria 2 的节点证书，域名随机池选取中..."
 
         # 常见域名池：避免单一 "www.bing.com" 成为 DPI 特征
         CERT_DOMAINS=(
@@ -1285,8 +1286,10 @@ read_current_config(){
             hop_interval=30
             min_hop_interval=""
             max_hop_interval=""
-            # 如果是 bing.com 则认为是自签证书
-            if [[ $hy_domain == "www.bing.com" ]]; then
+            # 自签证书的 issuer 和 subject 相同，据此判断 insecure
+            cert_subject=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null)
+            cert_issuer=$(openssl x509 -in "$cert_path" -noout -issuer 2>/dev/null)
+            if [[ -n "$cert_subject" && "$cert_subject" == "$cert_issuer" ]]; then
                 insecure=1
             else
                 insecure=0
