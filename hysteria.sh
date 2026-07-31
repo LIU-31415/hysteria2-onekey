@@ -1289,7 +1289,11 @@ read_current_config(){
             fi
         else
             hy_domain=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed 's/.*CN = //;s/,.*//' | sed 's/.*CN=//;s/,.*//')
-            [[ -z $hy_domain ]] && hy_domain="www.bing.com"
+            # 兜底：从域名池随机选取，与自签证书逻辑保持一致
+            if [[ -z $hy_domain ]]; then
+                CERT_DOMAINS_FALLBACK=("www.bing.com" "cdn.cloudflare.com" "update.microsoft.com" "dns.google" "www.msn.com")
+                hy_domain="${CERT_DOMAINS_FALLBACK[$RANDOM % ${#CERT_DOMAINS_FALLBACK[@]}]}"
+            fi
             hop_interval=30
             min_hop_interval=""
             max_hop_interval=""
