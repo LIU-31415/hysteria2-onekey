@@ -1602,7 +1602,7 @@ menu() {
     echo -e " 3. 关闭、开启、重启 Hysteria 2"
     echo -e " 4. 修改 Hysteria 2 配置"
     echo -e " 5. 显示 Hysteria 2 配置文件"
-    echo -e " 6. 更新脚本"
+    echo -e " 6. 更新脚本 + 内核 (Hysteria 2)"
     echo " ------------------------------------------------------------"
     echo -e " 0. 退出脚本"
     echo ""
@@ -1617,6 +1617,42 @@ menu() {
         0 ) exit 0 ;;
         * ) exit 1 ;;
     esac
+}
+
+# 更新 Hysteria 2 内核（服务端二进制）
+update_hysteria_kernel() {
+    yellow "正在检查 Hysteria 2 内核版本..."
+    local old_version=""
+    local new_version=""
+
+    if [[ -f /usr/local/bin/hysteria ]]; then
+        old_version=$(/usr/local/bin/hysteria version 2>/dev/null | head -n 1)
+        [[ -n $old_version ]] && yellow "当前版本：$old_version"
+    fi
+
+    bash <(curl -fsSL https://get.hy2.sh/) || {
+        red "内核更新失败，请检查网络后重试"
+        return 1
+    }
+
+    if [[ -f /usr/local/bin/hysteria ]]; then
+        new_version=$(/usr/local/bin/hysteria version 2>/dev/null | head -n 1)
+        if [[ -n $old_version && -n $new_version && $old_version == "$new_version" ]]; then
+            yellow "当前已是最新版本：$new_version"
+        else
+            [[ -n $new_version ]] && green "更新后版本：$new_version"
+        fi
+        # 二进制已覆盖，重启服务使新内核生效
+        if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+            systemctl try-restart hysteria-server >/dev/null 2>&1
+            green "Hysteria 2 内核已更新，服务已自动重启"
+        else
+            green "Hysteria 2 内核已更新（服务未运行，无需重启）"
+        fi
+    else
+        red "更新后未找到 hysteria 二进制，内核更新失败！"
+        return 1
+    fi
 }
 
 # 更新脚本
@@ -1659,6 +1695,15 @@ update_script() {
 
     rm -f "$tmp_file"
     green "请重新运行脚本以使用最新版本。"
+
+    # 一并更新 Hysteria 2 内核
+    echo ""
+    read -rp "是否同时更新 Hysteria 2 内核？(y/N): " updateKernelInput
+    if [[ $updateKernelInput == "y" || $updateKernelInput == "Y" ]]; then
+        update_hysteria_kernel
+    else
+        yellow "已跳过内核更新"
+    fi
     exit 0
 }
 
