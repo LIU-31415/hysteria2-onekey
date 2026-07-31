@@ -1602,11 +1602,13 @@ menu() {
     echo -e " 3. 关闭、开启、重启 Hysteria 2"
     echo -e " 4. 修改 Hysteria 2 配置"
     echo -e " 5. 显示 Hysteria 2 配置文件"
-    echo -e " 6. 更新脚本 + 内核 (Hysteria 2)"
+    echo " ------------------------------------------------------------"
+    echo -e " 6. 更新脚本"
+    echo -e " 7. 更新内核 (Hysteria 2)"
     echo " ------------------------------------------------------------"
     echo -e " 0. 退出脚本"
     echo ""
-    read -rp "请输入选项 [0-6]: " menuInput
+    read -rp "请输入选项 [0-7]: " menuInput
     case $menuInput in
         1 ) insthysteria ;;
         2 ) unsthysteria ;;
@@ -1614,6 +1616,7 @@ menu() {
         4 ) changeconf ;;
         5 ) showconf ;;
         6 ) update_script ;;
+        7 ) update_hysteria_kernel ;;
         0 ) exit 0 ;;
         * ) exit 1 ;;
     esac
@@ -1695,15 +1698,6 @@ update_script() {
 
     rm -f "$tmp_file"
     green "请重新运行脚本以使用最新版本。"
-
-    # 一并更新 Hysteria 2 内核
-    echo ""
-    read -rp "是否同时更新 Hysteria 2 内核？(y/N): " updateKernelInput
-    if [[ $updateKernelInput == "y" || $updateKernelInput == "Y" ]]; then
-        update_hysteria_kernel
-    else
-        yellow "已跳过内核更新"
-    fi
     exit 0
 }
 
