@@ -662,7 +662,8 @@ inst_cert(){
 }
 
 inst_port_config(){
-    remove_hy2_iptables_rules
+    # 注意：不要在函数开头删除旧规则，否则交互过程中 Ctrl+C 会留下已删未加的中间态。
+    # 旧规则保留到用户确认新配置后、写入新规则前才移除，保证中断时服务不中断。
 
     echo ""
     green "请选择端口使用模式："
@@ -696,6 +697,9 @@ inst_port_config(){
         hop_interval=""
         min_hop_interval=""
         max_hop_interval=""
+
+        # 新配置已确认，此时才移除旧规则
+        remove_hy2_iptables_rules
 
         if ! add_udp_input_rule "$port"; then
             yellow "警告：未能自动添加防火墙放行规则，请确认服务器安全组/防火墙已放行 UDP $port。"
@@ -812,6 +816,9 @@ inst_port_config(){
         fi
 
         port=$firstport
+
+        # 新配置已确认，此时才移除旧规则
+        remove_hy2_iptables_rules
 
         if ! add_port_hop_redirect_rule "$firstport:$endport" "$port"; then
             red "端口跳跃转发规则添加失败，请确认 iptables/ip6tables 可用。"
@@ -1338,7 +1345,7 @@ insthysteria(){
     fi
 
     # 获取服务器公网 IP（证书和客户端配置需要）
-    realip
+    # realip 在 inst_cert (ACME 分支) 和 generate_client_config 中会再次调用，这里不需要重复执行
 
     if [[ $SYSTEM == "CentOS" ]]; then
         ${PACKAGE_INSTALL[int]} curl wget sudo qrencode procps openssl iproute acl
