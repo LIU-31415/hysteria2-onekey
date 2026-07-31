@@ -446,7 +446,7 @@ install_management_command() {
     green "检测到脚本通过管道运行，正在从仓库获取脚本以安装管理命令..."
 
     if command -v curl &>/dev/null; then
-        curl -sL -o /usr/bin/hy2 "$REPO_URL" && chmod 755 /usr/bin/hy2
+        curl -fsL -o /usr/bin/hy2 "$REPO_URL" && chmod 755 /usr/bin/hy2
     elif command -v wget &>/dev/null; then
         wget -qO /usr/bin/hy2 "$REPO_URL" && chmod 755 /usr/bin/hy2
     fi
@@ -464,9 +464,18 @@ install_management_command() {
 }
 
 realip(){
-    ip=$(curl -s4m8 https://ip.sb -k 2>/dev/null | tr -d '\r\n[:space:]')
+    local source
+    # 多源 fallback：任一源返回有效 IP 即用，避免单点依赖某个服务
+    for source in "https://ip.sb" "https://api.ipify.org" "https://ifconfig.me"; do
+        ip=$(curl -s4m8 "$source" -k 2>/dev/null | tr -d '\r\n[:space:]')
+        [[ -n $ip ]] && break
+    done
     if [[ -z $ip ]]; then
-        ip=$(curl -s6m8 https://ip.sb -k 2>/dev/null | tr -d '\r\n[:space:]')
+        # IPv6 兜底
+        for source in "https://ip.sb" "https://api.ipify.org" "https://ifconfig.me"; do
+            ip=$(curl -s6m8 "$source" -k 2>/dev/null | tr -d '\r\n[:space:]')
+            [[ -n $ip ]] && break
+        done
     fi
     if [[ -z $ip ]]; then
         red "无法获取服务器公网 IP，请检查网络。"
@@ -546,7 +555,9 @@ inst_cert(){
 
         if [[ -f $cert_path && -f $key_path && -s $cert_path && -s $key_path ]] && [[ -f /root/ca.log ]]; then
             domain=$(cat /root/ca.log)
-            green "检测到原有域名：$domain 的证书，正在应用"
+            yellow "检测到上次申请的域名缓存（/root/ca.log）：$domain"
+            yellow "如需更换域名，请先执行：rm -f /root/ca.log，再重新运行"
+            green "正在应用已有证书：$domain"
             hy_domain=$domain
         else
             WARPv4Status=$(curl -s4m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
@@ -1411,7 +1422,7 @@ unsthysteria(){
     systemctl disable hysteria-server.service >/dev/null 2>&1
     rm -f /lib/systemd/system/hysteria-server.service /lib/systemd/system/hysteria-server@.service
     rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service
-    rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy /root/hysteria.sh
+    rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy /root/hysteria.sh /root/ca.log
     rm -f /usr/bin/hy2 /usr/local/bin/hy2-fix-cert-perms /etc/letsencrypt/renewal-hooks/deploy/hy2-fix-cert-perms
     remove_hy2_iptables_rules
     save_iptables_rules
@@ -1448,7 +1459,7 @@ hysteriaswitch(){
         1 ) starthysteria ;;
         2 ) stophysteria ;;
         3 ) stophysteria && starthysteria ;;
-        * ) exit 1 ;;
+        * ) yellow "无效选项，请重新输入" ; sleep 1 ; hysteriaswitch ;;
     esac
 }
 
@@ -1584,7 +1595,7 @@ changeconf(){
         4 ) changeproxysite ;;
         5 ) changebandwidth ;;
         6 ) changeobfs ;;
-        * ) exit 1 ;;
+        * ) yellow "无效选项，请重新输入" ; sleep 1 ; changeconf ;;
     esac
 }
 
@@ -1629,7 +1640,7 @@ menu() {
         6 ) update_script ;;
         7 ) update_hysteria_kernel ;;
         0 ) exit 0 ;;
-        * ) exit 1 ;;
+        * ) yellow "无效选项，请重新输入" ; sleep 1 ; menu ;;
     esac
 }
 
@@ -1676,7 +1687,7 @@ update_script() {
     yellow "正在检查脚本更新..."
 
     if command -v curl &>/dev/null; then
-        curl -sL -o "$tmp_file" "$REPO_URL" || { red "下载失败"; return 1; }
+        curl -fsL -o "$tmp_file" "$REPO_URL" || { red "下载失败"; return 1; }
     elif command -v wget &>/dev/null; then
         wget -qO "$tmp_file" "$REPO_URL" || { red "下载失败"; return 1; }
     else
