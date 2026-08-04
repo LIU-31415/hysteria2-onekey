@@ -682,7 +682,8 @@ inst_port_config(){
     echo -e "    ${PLAIN}说明：自动在多个端口间切换，有效对抗运营商针对性阻断和限速，连接更稳。"
     echo -e " ${GREEN}2.${PLAIN} 单端口模式 ${YELLOW}（默认，推荐）${PLAIN}"
     echo ""
-    read -rp "请输入选项 [1-2]: " portMode
+    read -rp "请输入选项 [1-2]（回车默认 2）: " portMode
+    [[ -z $portMode ]] && portMode=2
 
     if [[ $portMode == 2 ]]; then
         while true; do
