@@ -1612,6 +1612,46 @@ showconf(){
     green "$(cat /root/hy/url.txt)"
 }
 
+show_cert_fingerprint(){
+    # 显示服务器证书的 SHA256 指纹，供客户端证书固定（pinSHA256）使用
+    if [[ ! -f /etc/hysteria/config.yaml ]]; then
+        red "未找到配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
+    cert_path=$(yaml_unescape "$(grep "^[[:space:]]*cert:" /etc/hysteria/config.yaml | sed 's/^[[:space:]]*cert:[[:space:]]*//')")
+    [[ -z $cert_path ]] && cert_path="/etc/hysteria/cert.crt"
+    if [[ ! -f $cert_path ]]; then
+        red "未找到证书文件：$cert_path"
+        return 1
+    fi
+    fingerprint=$(openssl x509 -fingerprint -sha256 -noout -in "$cert_path" 2>/dev/null | sed 's/^SHA256 Fingerprint=//')
+    if [[ -z $fingerprint ]]; then
+        red "无法读取证书指纹，请确认证书文件有效"
+        return 1
+    fi
+    sni=$(yaml_unescape "$(grep "^[[:space:]]*sni:" /root/hy/hy-client.yaml 2>/dev/null | sed 's/^[[:space:]]*sni:[[:space:]]*//')")
+    echo ""
+    yellow "===================================================="
+    green "证书文件：$cert_path"
+    green "证书指纹（SHA256）："
+    echo ""
+    echo -e " ${GREEN}$fingerprint${PLAIN}"
+    echo ""
+    yellow "v2rayN 客户端设置："
+    echo " 1. 编辑 hy2 节点 → TLS 设置"
+    echo " 2. 取消勾选『跳过证书验证』"
+    echo " 3. 将上方指纹填入『证书指纹』字段（不要带 SHA256 Fingerprint= 前缀）"
+    echo ""
+    if [[ -n $sni ]]; then
+        yellow "Hysteria 2 原生客户端配置写法："
+        echo " tls:"
+        echo "   sni: $sni"
+        echo "   insecure: false"
+        echo "   pinSHA256: $fingerprint"
+    fi
+    yellow "===================================================="
+}
+
 menu() {
     clear
     echo "#############################################################"
@@ -1627,10 +1667,11 @@ menu() {
     echo " ------------------------------------------------------------"
     echo -e " 6. 更新脚本"
     echo -e " 7. 更新内核 (Hysteria 2)"
+    echo -e " 8. 显示证书指纹（客户端证书固定用）"
     echo " ------------------------------------------------------------"
     echo -e " 0. 退出脚本"
     echo ""
-    read -rp "请输入选项 [0-7]: " menuInput
+    read -rp "请输入选项 [0-8]: " menuInput
     case $menuInput in
         1 ) insthysteria ;;
         2 ) unsthysteria ;;
@@ -1639,6 +1680,7 @@ menu() {
         5 ) showconf ;;
         6 ) update_script ;;
         7 ) update_hysteria_kernel ;;
+        8 ) show_cert_fingerprint ;;
         0 ) exit 0 ;;
         * ) yellow "无效选项，请重新输入" ; sleep 1 ; menu ;;
     esac
