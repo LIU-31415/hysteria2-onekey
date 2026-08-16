@@ -109,6 +109,7 @@ assert_contains "$CLIENT_DIR/hy-client-tun.yaml" 'ipv4Exclude:'
 assert_contains "$CLIENT_DIR/hy-client-tun.yaml" '203.0.113.10/32'
 assert_contains "$CLIENT_DIR/hy-client-tun.yaml" 'timeout: 5m'
 assert_not_contains "$CLIENT_DIR/url.txt" 'mport='
+assert_not_contains "$CLIENT_DIR/url.txt" 'insecure='
 assert_contains "$CLIENT_DIR/url.txt" '@203.0.113.10:24443/?'
 
 generate_self_signed_certificate "$PUBLIC_IP"
@@ -118,6 +119,7 @@ assert_eq "$TLS_INSECURE" "1"
 generate_client_configs
 assert_contains "$CLIENT_DIR/hy-client.yaml" 'insecure: true'
 assert_contains "$CLIENT_DIR/hy-client.yaml" 'pinSHA256:'
+assert_contains "$CLIENT_DIR/url.txt" 'insecure=1'
 assert_contains "$CLIENT_DIR/url.txt" 'pinSHA256='
 
 PUBLIC_IP="2001:db8::1"

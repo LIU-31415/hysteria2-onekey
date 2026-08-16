@@ -4,7 +4,7 @@
 set -o pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.0.3"
+readonly SCRIPT_VERSION="2.0.4"
 readonly CORE_INSTALLER_URL="https://get.hy2.sh/"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh"
 
@@ -862,7 +862,8 @@ EOF
 
     uri_host="$(host_for_uri "$SERVER_ADDRESS")"
     uri_port="$SERVER_PORT"
-    query="sni=$(uri_encode "$TLS_SNI")&insecure=${TLS_INSECURE}&obfs=salamander&obfs-password=$(uri_encode "$OBFS_PASSWORD")"
+    query="sni=$(uri_encode "$TLS_SNI")&obfs=salamander&obfs-password=$(uri_encode "$OBFS_PASSWORD")"
+    [[ "$TLS_INSECURE" == "1" ]] && query+="&insecure=1"
     [[ -n "$TLS_PIN_SHA256" ]] && query+="&pinSHA256=$(uri_encode "$TLS_PIN_SHA256")"
     uri="hysteria2://$(uri_encode "$AUTH_PASSWORD")@${uri_host}:${uri_port}/?${query}#hy2"
     printf '%s\n' "$uri" >"$url_file" || return 1
