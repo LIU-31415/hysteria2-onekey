@@ -1,1785 +1,1387 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Hysteria 2 one-key installer for personal Linux VPS.
 
-export LANG=en_US.UTF-8
+set -o pipefail
+umask 077
 
-RED="\033[31m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-PLAIN="\033[0m"
+readonly SCRIPT_VERSION="2.0.1"
+readonly CORE_INSTALLER_URL="https://get.hy2.sh/"
 
-red(){
-    echo -e "\033[31m\033[01m$1\033[0m"
-}
+if [[ "${HY2_TEST_MODE:-0}" == "1" ]]; then
+    CONFIG_DIR="${HY2_CONFIG_DIR:-/etc/hysteria}"
+    CONFIG_FILE="${HY2_CONFIG_FILE:-${CONFIG_DIR}/config.yaml}"
+    STATE_FILE="${HY2_STATE_FILE:-${CONFIG_DIR}/installer-state.conf}"
+    CERT_FILE="${HY2_CERT_FILE:-${CONFIG_DIR}/server.crt}"
+    KEY_FILE="${HY2_KEY_FILE:-${CONFIG_DIR}/server.key}"
+    CLIENT_DIR="${HY2_CLIENT_DIR:-/root/hy}"
+    BACKUP_DIR="${HY2_BACKUP_DIR:-${CONFIG_DIR}/backups}"
+    HYSTERIA_BIN="${HY2_BIN:-/usr/local/bin/hysteria}"
+    MANAGEMENT_BIN="${HY2_MANAGEMENT_BIN:-/usr/bin/hy2}"
+    SERVICE_NAME="${HY2_SERVICE_NAME:-hysteria-server.service}"
+    SERVICE_FILE="${HY2_SERVICE_FILE:-/etc/systemd/system/hysteria-server.service}"
+    SERVICE_TEMPLATE_FILE="${HY2_SERVICE_TEMPLATE_FILE:-/etc/systemd/system/hysteria-server@.service}"
+    ACME_HOME="${HY2_ACME_HOME:-/root/.acme.sh}"
+    HYSTERIA_HOME_DIR="${HY2_HYSTERIA_HOME_DIR:-/var/lib/hysteria}"
+else
+    CONFIG_DIR="/etc/hysteria"; CONFIG_FILE="/etc/hysteria/config.yaml"
+    STATE_FILE="/etc/hysteria/installer-state.conf"
+    CERT_FILE="/etc/hysteria/server.crt"; KEY_FILE="/etc/hysteria/server.key"
+    CLIENT_DIR="/root/hy"; BACKUP_DIR="/etc/hysteria/backups"
+    HYSTERIA_BIN="/usr/local/bin/hysteria"; MANAGEMENT_BIN="/usr/bin/hy2"
+    SERVICE_NAME="hysteria-server.service"; SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
+    SERVICE_TEMPLATE_FILE="/etc/systemd/system/hysteria-server@.service"
+    ACME_HOME="/root/.acme.sh"; HYSTERIA_HOME_DIR="/var/lib/hysteria"
+fi
+CURRENT_CERT_FILE="$CERT_FILE"
+CURRENT_KEY_FILE="$KEY_FILE"
 
-green(){
-    echo -e "\033[32m\033[01m$1\033[0m"
-}
-
-yellow(){
-    echo -e "\033[33m\033[01m$1\033[0m"
-}
-
-REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "amazon linux" "fedora")
-RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora")
-PACKAGE_UPDATE=("apt-get update" "apt-get update" "yum -y update" "yum -y update" "yum -y update")
-PACKAGE_INSTALL=("apt -y install" "apt -y install" "yum -y install" "yum -y install" "yum -y install")
-
-IPTABLES_NAT_COMMENT="hy2-port-hop"
-IPTABLES_INPUT_COMMENT="hy2-udp-input"
-PORT_STATE_FILE="/etc/hysteria/port_state.conf"
-
-# 混淆（obfuscation）全局配置
-OBFS_ENABLED=0
-OBFS_TYPE="salamander"
+PUBLIC_IP=""
+SERVER_ADDRESS=""
+SERVER_PORT="443"
+AUTH_PASSWORD=""
 OBFS_PASSWORD=""
+CERT_MODE="ip-acme"
+TLS_SNI=""
+TLS_INSECURE="0"
+TLS_PIN_SHA256=""
+ACME_CHALLENGE_PORT=""
+ACME_OWNED="0"
+HYSTERIA_USER_OWNED="0"
+HYSTERIA_CORE_OWNED="0"
+FAILED_ACME_IDENTIFIER=""
+TRANSACTION_DIR=""
+TRANSACTION_ACTIVE="0"
 
-# 脚本仓库地址（更新和 hy2 重装使用）
-REPO_URL="https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh"
-
-has_cmd() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-iptables_do() {
-    local bin="$1"
-    shift
-    if has_cmd "$bin"; then
-        "$bin" -w 5 "$@" 2>/dev/null || "$bin" "$@" 2>/dev/null
-    else
-        return 1
-    fi
-}
-
-is_ipv4() {
-    [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
-}
-
-is_ipv6() {
-    [[ $1 == *:* ]]
-}
-
-strip_url_scheme() {
-    local v="$1"
-    v="${v#http://}"
-    v="${v#https://}"
-    printf "%s" "$v"
-}
-
-
-[[ $EUID -ne 0 ]] && red "注意: 请在root用户下运行脚本" && exit 1
-
-CMD=("$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)" "$(hostnamectl 2>/dev/null | grep -i system | cut -d : -f2)" "$(lsb_release -sd 2>/dev/null)" "$(grep -i description /etc/lsb-release 2>/dev/null | cut -d \" -f2)" "$(grep . /etc/redhat-release 2>/dev/null)" "$(grep . /etc/issue 2>/dev/null | cut -d \\ -f1 | sed '/^[ ]*$/d')")
-
-SYS=""
-for i in "${CMD[@]}"; do
-    SYS="$i" && [[ -n $SYS ]] && break
-done
-
-SYSTEM=""
-int=0
-for ((int = 0; int < ${#REGEX[@]}; int++)); do
-    if [[ $(echo "$SYS" | tr '[:upper:]' '[:lower:]') =~ ${REGEX[int]} ]]; then
-        SYSTEM="${RELEASE[int]}"
-        [[ -n $SYSTEM ]] && break
-    fi
-done
-
-[[ -z $SYSTEM ]] && red "目前暂不支持你的VPS的操作系统！" && exit 1
-
-if [[ -z $(type -P curl) ]]; then
-    if [[ ! $SYSTEM == "CentOS" ]]; then
-        ${PACKAGE_UPDATE[int]}
-    fi
-    ${PACKAGE_INSTALL[int]} curl
+if [[ -t 1 ]]; then
+    C_RED='\033[31m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_BLUE='\033[36m'; C_RESET='\033[0m'
+else
+    C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''; C_RESET=''
 fi
 
-# URL编码函数
-urlencode() {
-    local string="$1"
-    local strlen=${#string}
-    local encoded=""
-    local pos c o
+info() { printf '%b[信息]%b %s\n' "$C_BLUE" "$C_RESET" "$*"; }
+success() { printf '%b[完成]%b %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%b[注意]%b %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+error() { printf '%b[错误]%b %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+die() { error "$*"; return 1; }
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-    for (( pos=0 ; pos<strlen ; pos++ )); do
-        c=${string:$pos:1}
-        case "$c" in
-            [-_.~a-zA-Z0-9] ) o="$c" ;;
-            * ) printf -v o '%%%02X' "'$c" ;;
-        esac
-        encoded+="$o"
+is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
+has_valid_installer_state() {
+    [[ -f "$STATE_FILE" && -n "$(state_get_from "$STATE_FILE" version 2>/dev/null || true)" ]]
+}
+managed_paths_are_safe() {
+    local path resolved
+    for path in "$CONFIG_DIR" "$CLIENT_DIR" "$BACKUP_DIR"; do
+        [[ ! -L "$path" ]] || return 1
+        resolved="$(readlink -m -- "$path" 2>/dev/null)" || return 1
+        [[ "$resolved" == "$path" ]] || return 1
     done
-    echo "$encoded"
+    for path in "$CONFIG_FILE" "$STATE_FILE" "$CERT_FILE" "$KEY_FILE"; do
+        [[ ! -L "$path" ]] || return 1
+    done
+}
+is_safe_tree_path() {
+    local target="$1" resolved
+    case "$target" in
+        "$CONFIG_DIR"|"$CLIENT_DIR"|"$BACKUP_DIR"|"$ACME_HOME"|"$HYSTERIA_HOME_DIR"|/tmp/hy2-transaction.*|/tmp/hy2-certcheck.*) ;;
+        *) return 1 ;;
+    esac
+    resolved="$(readlink -m -- "$target" 2>/dev/null)" || return 1
+    [[ -n "$resolved" && ${#resolved} -ge 6 ]] || return 1
+    case "$resolved" in /|/root|/etc|/usr|/var|/tmp) return 1 ;; esac
+}
+safe_remove_tree() {
+    is_safe_tree_path "$1" || { error "拒绝删除不安全路径：$1"; return 1; }
+    rm -rf -- "$1"
 }
 
-# YAML 单引号字符串转义函数
-yaml_escape() {
-    local string="$1"
-    string=${string//\'/\'\'}
-    printf "'%s'" "$string"
+trim() {
+    local value="$*"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
 }
 
-
-# YAML 单引号字符串反转义函数
-yaml_unescape() {
-    local string="$1"
-    string="${string#"${string%%[![:space:]]*}"}"
-    string="${string%"${string##*[![:space:]]}"}"
-    if [[ $string == \'*\' ]]; then
-        string=${string:1:${#string}-2}
-        string=${string//\'\'/\'}
-    elif [[ $string == \"*\" ]]; then
-        string=${string:1:${#string}-2}
+random_secret() {
+    local length="${1:-24}"
+    local value
+    if has_cmd openssl; then
+        value="$(openssl rand -hex $(((length + 1) / 2)))" || return 1
+    else
+        value="$(od -An -N "$length" -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')" || return 1
     fi
-    printf "%s" "$string"
+    printf '%s' "${value:0:length}"
 }
 
-# JSON 字符串转义函数
-json_escape() {
-    local string="$1"
-    string=${string//\\/\\\\}
-    string=${string//\"/\\\"}
-    string=${string//$'\n'/\\n}
-    string=${string//$'\r'/\\r}
-    string=${string//$'\t'/\\t}
-    string=${string//$'\b'/\\b}
-    string=${string//$'\f'/\\f}
-    printf "%s" "$string"
+valid_ipv4() {
+    local ip="$1" part
+    local -a parts=()
+    local IFS='.'
+    read -r -a parts <<<"$ip"
+    [[ ${#parts[@]} -eq 4 ]] || return 1
+    for part in "${parts[@]}"; do
+        [[ "$part" =~ ^[0-9]{1,3}$ ]] || return 1
+        ((10#$part <= 255)) || return 1
+    done
 }
 
-# 生成更高复杂度的随机密码
-generate_password() {
-    LC_ALL=C tr -dc 'A-Za-z0-9!@#%^&*()_+-=' </dev/urandom 2>/dev/null | head -c 32
+valid_ipv6() {
+    local ip="$1" left right group ipv4_tail
+    local -a left_groups=() right_groups=() groups=()
+    [[ "$ip" == *:* && "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+
+    if [[ "$ip" == *.* ]]; then
+        ipv4_tail="${ip##*:}"
+        valid_ipv4 "$ipv4_tail" || return 1
+        ip="${ip%:*}:0:0"
+    fi
+
+    [[ "$ip" != *:::* ]] || return 1
+    if [[ "$ip" == *::* ]]; then
+        left="${ip%%::*}"
+        right="${ip#*::}"
+        [[ "$right" != *::* ]] || return 1
+        [[ -z "$left" ]] || IFS=: read -r -a left_groups <<<"$left"
+        [[ -z "$right" ]] || IFS=: read -r -a right_groups <<<"$right"
+        ((${#left_groups[@]} + ${#right_groups[@]} < 8)) || return 1
+        groups=("${left_groups[@]}" "${right_groups[@]}")
+    else
+        [[ "$ip" != :* && "$ip" != *: ]] || return 1
+        IFS=: read -r -a groups <<<"$ip"
+        ((${#groups[@]} == 8)) || return 1
+    fi
+    for group in "${groups[@]}"; do
+        [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
 }
 
-is_number() {
-    [[ $1 =~ ^[0-9]+$ ]]
+valid_ip() { valid_ipv4 "$1" || valid_ipv6 "$1"; }
+valid_hostname() {
+    local name="$1"
+    [[ ${#name} -le 253 && "$name" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
+}
+valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
+valid_secret() {
+    [[ -n "$1" && ${#1} -le 256 ]] || return 1
+    ! printf '%s' "$1" | LC_ALL=C grep -q '[[:cntrl:]]'
 }
 
-valid_port() {
-    is_number "$1" && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+yaml_quote() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    printf '"%s"' "$value"
 }
 
-valid_hop_interval() {
-    is_number "$1" && (( 10#$1 >= 5 ))
+yaml_unquote() {
+    local value out="" char next i
+    value="$(trim "$1")"
+    if [[ ${#value} -ge 2 && "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+        for ((i=0; i<${#value}; i++)); do
+            char="${value:i:1}"
+            if [[ "$char" == '\' && $((i + 1)) -lt ${#value} ]]; then
+                next="${value:i+1:1}"
+                case "$next" in
+                    n) out+=$'\n' ;;
+                    '"') out+='"' ;;
+                    '\') out+='\' ;;
+                    *) out+="\\${next}" ;;
+                esac
+                i=$((i + 1))
+            else
+                out+="$char"
+            fi
+        done
+        printf '%s' "$out"
+    elif [[ ${#value} -ge 2 && "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+        printf '%s' "${value//\'\'/\'}"
+    else
+        printf '%s' "$value"
+    fi
 }
 
-is_udp_port_in_use() {
-    local check_port="$1"
-    if ! has_cmd ss; then
+uri_encode() {
+    local input="$1" out="" byte char
+    local -a bytes=()
+    while read -r -a bytes; do
+        for byte in "${bytes[@]}"; do
+            case "$byte" in
+                2d|2e|3[0-9]|4[1-9a-f]|5[0-9a]|5f|6[1-9a-f]|7[0-9a]|7e)
+                    printf -v char '%b' "\\x${byte}"
+                    out+="$char"
+                    ;;
+                *) out+="%${byte^^}" ;;
+            esac
+        done
+    done < <(printf '%s' "$input" | od -An -v -tx1)
+    printf '%s' "$out"
+}
+
+host_for_uri() {
+    if valid_ipv6 "$1"; then printf '[%s]' "$1"; else printf '%s' "$1"; fi
+}
+
+state_get_from() {
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 1
+    awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$file"
+}
+state_get() { state_get_from "$STATE_FILE" "$1"; }
+atomic_install_file() {
+    local source="$1" target="$2" mode="${3:-600}" owner="${4:-root}" group="${5:-root}" temp
+    mkdir -p "$(dirname "$target")" || return 1
+    temp="${target}.new.$$"
+    install -m "$mode" -o "$owner" -g "$group" "$source" "$temp" || { rm -f "$temp"; return 1; }
+    mv -f "$temp" "$target" || { rm -f "$temp"; return 1; }
+}
+
+require_root() {
+    is_root || die "请使用 root 运行：sudo bash hysteria.sh"
+}
+
+detect_os() {
+    [[ -r /etc/os-release ]] || die "无法识别系统，仅支持使用 systemd 的主流 Linux 发行版。"
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case "${ID:-}" in
+        debian|ubuntu|kali|linuxmint) PACKAGE_FAMILY="apt" ;;
+        centos|rhel|almalinux|rocky|fedora|ol) PACKAGE_FAMILY="rpm" ;;
+        *)
+            case "${ID_LIKE:-}" in
+                *debian*) PACKAGE_FAMILY="apt" ;;
+                *rhel*|*fedora*) PACKAGE_FAMILY="rpm" ;;
+                *) die "暂不支持此系统：${PRETTY_NAME:-unknown}" ;;
+            esac
+            ;;
+    esac
+    has_cmd systemctl || die "此脚本需要 systemd。"
+}
+
+install_dependencies() {
+    local missing=() cmd
+    for cmd in curl openssl awk sed grep ss socat; do
+        has_cmd "$cmd" || missing+=("$cmd")
+    done
+    ((${#missing[@]} == 0)) && return 0
+    info "安装基础依赖：${missing[*]}"
+    if [[ "$PACKAGE_FAMILY" == "apt" ]]; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y || return 1
+        apt-get install -y curl ca-certificates openssl iproute2 gawk sed grep socat || return 1
+    else
+        local manager="dnf"; has_cmd dnf || manager="yum"
+        "$manager" install -y curl ca-certificates openssl iproute gawk sed grep socat || return 1
+    fi
+}
+
+check_crypto_capabilities() {
+    local req_help x509_help
+    req_help="$(openssl req -help 2>&1)" || true
+    x509_help="$(openssl x509 -help 2>&1)" || true
+    if [[ "$req_help" != *"-addext"* || "$x509_help" != *"-checkip"* ]]; then
+        error "OpenSSL 版本过旧；请使用带 OpenSSL 1.1.1+ 的受支持系统。"
         return 1
     fi
-    ss -H -uln 2>/dev/null | awk '{print $5}' | sed 's/.*://g' | grep -w "$check_port" >/dev/null 2>&1
 }
 
-check_udp_range_conflict() {
-    local start="$1"
-    local end="$2"
-    local p
-    local conflicts=()
-    local used_ports=""
-
-    # 一次性获取所有 UDP 监听端口列表，避免逐个端口调用 ss（1000 端口范围时性能提升显著）
-    if has_cmd ss; then
-        used_ports=$(ss -H -uln 2>/dev/null | awk '{print $5}' | sed 's/.*://g')
-    fi
-    [[ -z "$used_ports" ]] && return 0
-
-    for ((p=start; p<=end; p++)); do
-        if grep -wq "$p" <<< "$used_ports" 2>/dev/null; then
-            conflicts+=("$p")
-            [[ ${#conflicts[@]} -ge 8 ]] && break
-        fi
+fetch_public_ip() {
+    local candidate family url
+    for family in 4 6; do
+        for url in https://api64.ipify.org https://ifconfig.co/ip https://icanhazip.com; do
+            candidate="$(curl -"$family"fsS --connect-timeout 4 --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]')" || true
+            if valid_ip "$candidate"; then
+                PUBLIC_IP="$candidate"
+                return 0
+            fi
+        done
     done
-
-    if [[ ${#conflicts[@]} -gt 0 ]]; then
-        red "端口范围内发现 UDP 端口已被占用：${conflicts[*]}"
-        red "端口跳跃会接管整个范围，请更换一个完全空闲的范围。"
-        return 1
-    fi
-
-    return 0
-}
-
-remove_rules_by_comment() {
-    local bin="$1"
-    local table="$2"
-    local chain="$3"
-    local comment="$4"
-    local line
-    local count=0
-
-    if ! has_cmd "$bin"; then
-        return 0
-    fi
-
-    while true; do
-        if [[ -n "$table" ]]; then
-            line=$("$bin" -t "$table" -L "$chain" --line-numbers -n -v 2>/dev/null | grep -F "$comment" | awk '{print $1}' | head -n 1)
-        else
-            line=$("$bin" -L "$chain" --line-numbers -n -v 2>/dev/null | grep -F "$comment" | awk '{print $1}' | head -n 1)
-        fi
-
-        [[ -z "$line" ]] && break
-
-        if [[ -n "$table" ]]; then
-            "$bin" -t "$table" -D "$chain" "$line" >/dev/null 2>&1 || break
-        else
-            "$bin" -D "$chain" "$line" >/dev/null 2>&1 || break
-        fi
-
-        ((count++))
-        [[ $count -gt 100 ]] && break
-    done
-}
-
-remove_hy2_iptables_rules() {
-    remove_rules_by_comment iptables nat PREROUTING "$IPTABLES_NAT_COMMENT"
-    remove_rules_by_comment ip6tables nat PREROUTING "$IPTABLES_NAT_COMMENT"
-    remove_rules_by_comment iptables "" INPUT "$IPTABLES_INPUT_COMMENT"
-    remove_rules_by_comment ip6tables "" INPUT "$IPTABLES_INPUT_COMMENT"
-}
-
-add_udp_input_rule() {
-    local range="$1"
-    local ok=1
-
-    iptables_do iptables -I INPUT -p udp --dport "$range" -m comment --comment "$IPTABLES_INPUT_COMMENT" -j ACCEPT && ok=0
-    iptables_do ip6tables -I INPUT -p udp --dport "$range" -m comment --comment "$IPTABLES_INPUT_COMMENT" -j ACCEPT && ok=0
-
-    return "$ok"
-}
-
-add_port_hop_redirect_rule() {
-    local range="$1"
-    local target_port="$2"
-    local ok=1
-
-    iptables_do iptables -t nat -A PREROUTING -p udp --dport "$range" -m comment --comment "$IPTABLES_NAT_COMMENT" -j REDIRECT --to-ports "$target_port" && ok=0
-    iptables_do ip6tables -t nat -A PREROUTING -p udp --dport "$range" -m comment --comment "$IPTABLES_NAT_COMMENT" -j REDIRECT --to-ports "$target_port" && ok=0
-
-    return "$ok"
-}
-
-save_port_state() {
-    mkdir -p /etc/hysteria
-    cat > "$PORT_STATE_FILE" << EOF
-PORT='$port'
-FIRSTPORT='$firstport'
-ENDPORT='$endport'
-HOP_INTERVAL='$hop_interval'
-MIN_HOP_INTERVAL='$min_hop_interval'
-MAX_HOP_INTERVAL='$max_hop_interval'
-EOF
-    chmod 600 "$PORT_STATE_FILE"
-}
-
-load_port_state() {
-    if [[ -f "$PORT_STATE_FILE" ]]; then
-        # shellcheck disable=SC1090
-        source "$PORT_STATE_FILE"
-        port="$PORT"
-        firstport="$FIRSTPORT"
-        endport="$ENDPORT"
-        hop_interval="$HOP_INTERVAL"
-        min_hop_interval="$MIN_HOP_INTERVAL"
-        max_hop_interval="$MAX_HOP_INTERVAL"
-        return 0
-    fi
     return 1
 }
 
-grant_traverse_permission() {
-    local target_path="$1"
-    local dir
-    local current_path=""
-    local part
-
-    dir=$(dirname "$target_path")
-    IFS='/' read -ra path_parts <<< "$dir"
-    for part in "${path_parts[@]}"; do
-        [[ -z "$part" ]] && continue
-        current_path="$current_path/$part"
-        if id "hysteria" &>/dev/null && has_cmd setfacl; then
-            setfacl -m u:hysteria:--x "$current_path" 2>/dev/null || true
-        else
-            chmod o+x "$current_path" 2>/dev/null || true
-        fi
-    done
+ensure_hysteria_user() {
+    if ! id hysteria >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin hysteria || return 1
+    fi
 }
 
-grant_cert_read_permissions() {
-    local cert_file="$1"
-    local key_file="$2"
-    local real_cert_path
-    local real_key_path
+download_checked_script() {
+    local url="$1" output="$2"
+    curl -fL --retry 3 --connect-timeout 10 --max-time 120 "$url" -o "$output" || return 1
+    [[ "$(head -n 1 "$output")" == '#!'* ]] || { error "下载内容不是脚本：$url"; return 1; }
+    bash -n "$output" || { error "下载脚本语法检查失败：$url"; return 1; }
+    chmod 700 "$output"
+}
 
-    real_cert_path=$(readlink -f "$cert_file" 2>/dev/null || echo "$cert_file")
-    real_key_path=$(readlink -f "$key_file" 2>/dev/null || echo "$key_file")
+install_hysteria_core() {
+    local installer
+    installer="$(mktemp /tmp/hy2-core-installer.XXXXXX)" || return 1
+    if ! download_checked_script "$CORE_INSTALLER_URL" "$installer"; then
+        rm -f "$installer"
+        return 1
+    fi
+    info "安装 Hysteria 2 官方内核"
+    bash "$installer" || { rm -f "$installer"; return 1; }
+    rm -f "$installer"
+    [[ -x "$HYSTERIA_BIN" ]] || die "官方安装完成，但未找到内核：$HYSTERIA_BIN"
+}
 
-    grant_traverse_permission "$real_cert_path"
-    grant_traverse_permission "$real_key_path"
+ensure_service_unit() {
+    ensure_hysteria_user || return 1
+    mkdir -p "$CONFIG_DIR" || return 1
+    cat >"${SERVICE_FILE}.new" <<EOF || return 1
+[Unit]
+Description=Hysteria 2 Server
+Documentation=https://v2.hysteria.network/
+After=network-online.target
+Wants=network-online.target
 
-    if id "hysteria" &>/dev/null && has_cmd setfacl; then
-        setfacl -m u:hysteria:r "$real_cert_path" "$real_key_path" 2>/dev/null || true
-        setfacl -d -m u:hysteria:r "$(dirname "$real_cert_path")" 2>/dev/null || true
-        setfacl -d -m u:hysteria:r "$(dirname "$real_key_path")" 2>/dev/null || true
-    elif id "hysteria" &>/dev/null; then
-        chgrp hysteria "$real_cert_path" "$real_key_path" 2>/dev/null || true
-        chmod g+r "$real_cert_path" "$real_key_path" 2>/dev/null || true
+[Service]
+Type=simple
+User=hysteria
+Group=hysteria
+ExecStart=${HYSTERIA_BIN} server -c ${CONFIG_FILE}
+WorkingDirectory=${CONFIG_DIR}
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1048576
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=${CONFIG_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    [[ -s "${SERVICE_FILE}.new" ]] || return 1
+    chmod 644 "${SERVICE_FILE}.new" || return 1
+    mv -f "${SERVICE_FILE}.new" "$SERVICE_FILE" || return 1
+    if has_cmd restorecon; then restorecon -F "$SERVICE_FILE" >/dev/null 2>&1 || true; fi
+    systemctl daemon-reload || return 1
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+}
+
+secure_files() {
+    mkdir -p "$CONFIG_DIR" "$CLIENT_DIR" "$BACKUP_DIR" || return 1
+    chown root:hysteria "$CONFIG_DIR" "$BACKUP_DIR" || return 1
+    chown root:root "$CLIENT_DIR" || return 1
+    chmod 750 "$CONFIG_DIR" "$BACKUP_DIR" || return 1
+    chmod 700 "$CLIENT_DIR" || return 1
+    if [[ -f "$CONFIG_FILE" ]]; then chown root:hysteria "$CONFIG_FILE" && chmod 640 "$CONFIG_FILE" || return 1; fi
+    if [[ -f "$CERT_FILE" ]]; then chown root:hysteria "$CERT_FILE" && chmod 640 "$CERT_FILE" || return 1; fi
+    if [[ -f "$KEY_FILE" ]]; then chown root:hysteria "$KEY_FILE" && chmod 640 "$KEY_FILE" || return 1; fi
+    if [[ -f "$STATE_FILE" ]]; then chmod 600 "$STATE_FILE" || return 1; fi
+    find "$CLIENT_DIR" -maxdepth 1 -type f -exec chown root:root {} + -exec chmod 600 {} + || return 1
+    if has_cmd restorecon; then restorecon -RF "$CONFIG_DIR" >/dev/null 2>&1 || true; fi
+    return 0
+}
+
+remove_legacy_crontab_entry() {
+    local crontab_file="/etc/crontab" temp exact mode owner group
+    [[ -f "$crontab_file" ]] || return 0
+    exact="0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1"
+    grep -Fqx "$exact" "$crontab_file" || return 0
+    temp="$(mktemp /tmp/hy2-crontab.XXXXXX)" || return 1
+    grep -Fvx "$exact" "$crontab_file" >"$temp" || true
+    mode="$(stat -c %a "$crontab_file")" || { rm -f "$temp"; return 1; }
+    owner="$(stat -c %u "$crontab_file")" || { rm -f "$temp"; return 1; }
+    group="$(stat -c %g "$crontab_file")" || { rm -f "$temp"; return 1; }
+    atomic_install_file "$temp" "$crontab_file" "$mode" "$owner" "$group" || { rm -f "$temp"; return 1; }
+    rm -f "$temp"
+    if has_cmd restorecon; then restorecon -F "$crontab_file" >/dev/null 2>&1 || true; fi
+}
+
+cleanup_legacy_artifacts() {
+    remove_legacy_crontab_entry || true
+    rm -f /usr/local/bin/hy2-fix-cert-perms \
+        /etc/letsencrypt/renewal-hooks/deploy/hy2-fix-cert-perms
+}
+
+snapshot_path() {
+    local label="$1" path="$2"
+    if [[ -e "$path" || -L "$path" ]]; then
+        printf '%s=1\n' "$label" >>"$TRANSACTION_DIR/manifest"
+        cp -a -- "$path" "$TRANSACTION_DIR/$label" || return 1
     else
-        chmod o+r "$real_cert_path" "$real_key_path" 2>/dev/null || true
-    fi
-
-    # 最大兼容兜底：如果没有 setfacl/chgrp 或续签后新文件未继承 ACL，仍允许服务读取。
-    # 这里不复制、不搬运证书，只对原路径授予读取权限。
-    chmod o+r "$real_cert_path" "$real_key_path" 2>/dev/null || true
-}
-
-
-install_cert_permission_helper() {
-    mkdir -p /usr/local/bin
-    cat > /usr/local/bin/hy2-fix-cert-perms <<'EOS'
-#!/bin/bash
-
-CONFIG_FILE="/etc/hysteria/config.yaml"
-
-has_cmd() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-yaml_unescape_local() {
-    local string="$1"
-    string="${string#"${string%%[![:space:]]*}"}"
-    string="${string%"${string##*[![:space:]]}"}"
-    if [[ $string == \'*\' ]]; then
-        string=${string:1:${#string}-2}
-        string=${string//\'\'/\'}
-    elif [[ $string == \"*\" ]]; then
-        string=${string:1:${#string}-2}
-    fi
-    printf "%s" "$string"
-}
-
-grant_traverse_permission_local() {
-    local target_path="$1"
-    local dir
-    local current_path=""
-    local part
-
-    dir=$(dirname "$target_path")
-    IFS='/' read -ra path_parts <<< "$dir"
-    for part in "${path_parts[@]}"; do
-        [[ -z "$part" ]] && continue
-        current_path="$current_path/$part"
-        if id "hysteria" &>/dev/null && has_cmd setfacl; then
-            setfacl -m u:hysteria:--x "$current_path" 2>/dev/null || true
-        else
-            chmod o+x "$current_path" 2>/dev/null || true
-        fi
-    done
-}
-
-grant_cert_read_permissions_local() {
-    local cert_file="$1"
-    local key_file="$2"
-    local real_cert_path
-    local real_key_path
-
-    real_cert_path=$(readlink -f "$cert_file" 2>/dev/null || echo "$cert_file")
-    real_key_path=$(readlink -f "$key_file" 2>/dev/null || echo "$key_file")
-
-    [[ -f "$real_cert_path" && -f "$real_key_path" ]] || exit 0
-
-    grant_traverse_permission_local "$real_cert_path"
-    grant_traverse_permission_local "$real_key_path"
-
-    if id "hysteria" &>/dev/null && has_cmd setfacl; then
-        setfacl -m u:hysteria:r "$real_cert_path" "$real_key_path" 2>/dev/null || true
-        setfacl -d -m u:hysteria:r "$(dirname "$real_cert_path")" 2>/dev/null || true
-        setfacl -d -m u:hysteria:r "$(dirname "$real_key_path")" 2>/dev/null || true
-    elif id "hysteria" &>/dev/null; then
-        chgrp hysteria "$real_cert_path" "$real_key_path" 2>/dev/null || true
-        chmod g+r "$real_cert_path" "$real_key_path" 2>/dev/null || true
-    fi
-
-    # 兼容优先：不搬运证书，直接确保原始目标文件可被服务读取。
-    chmod o+r "$real_cert_path" "$real_key_path" 2>/dev/null || true
-}
-
-[[ -f "$CONFIG_FILE" ]] || exit 0
-cert_path=$(yaml_unescape_local "$(grep "^[[:space:]]*cert:" "$CONFIG_FILE" | head -1 | sed 's/^[[:space:]]*cert:[[:space:]]*//')")
-key_path=$(yaml_unescape_local "$(grep "^[[:space:]]*key:" "$CONFIG_FILE" | head -1 | sed 's/^[[:space:]]*key:[[:space:]]*//')")
-[[ -n "$cert_path" && -n "$key_path" ]] || exit 0
-
-grant_cert_read_permissions_local "$cert_path" "$key_path"
-EOS
-    chmod +x /usr/local/bin/hy2-fix-cert-perms
-
-    # Certbot 续签后自动重新授权。这个 hook 不复制、不搬运证书，只重授读取权限。
-    mkdir -p /etc/letsencrypt/renewal-hooks/deploy 2>/dev/null || true
-    if [[ -d /etc/letsencrypt/renewal-hooks/deploy ]]; then
-        cat > /etc/letsencrypt/renewal-hooks/deploy/hy2-fix-cert-perms <<'EOS'
-#!/bin/bash
-/usr/local/bin/hy2-fix-cert-perms >/dev/null 2>&1 || true
-systemctl try-restart hysteria-server >/dev/null 2>&1 || true
-EOS
-        chmod +x /etc/letsencrypt/renewal-hooks/deploy/hy2-fix-cert-perms
+        printf '%s=0\n' "$label" >>"$TRANSACTION_DIR/manifest"
     fi
 }
 
-install_management_command() {
-    local src=""
+abort_transaction_snapshot() {
+    if [[ "$TRANSACTION_DIR" == /tmp/hy2-transaction.* ]]; then safe_remove_tree "$TRANSACTION_DIR" || true; fi
+    TRANSACTION_DIR=""; TRANSACTION_ACTIVE="0"
+}
 
-    if [[ -n ${BASH_SOURCE[0]} && -f ${BASH_SOURCE[0]} ]]; then
-        src="${BASH_SOURCE[0]}"
-    elif [[ -f "$0" && "$0" != "bash" && "$0" != "-bash" ]]; then
-        src="$0"
-    fi
+begin_transaction() {
+    [[ "$TRANSACTION_ACTIVE" == "0" ]] || return 1
+    TRANSACTION_DIR="$(mktemp -d /tmp/hy2-transaction.XXXXXX)" || return 1
+    : >"$TRANSACTION_DIR/manifest"
+    snapshot_path config_dir "$CONFIG_DIR" || { abort_transaction_snapshot; return 1; }
+    snapshot_path client_dir "$CLIENT_DIR" || { abort_transaction_snapshot; return 1; }
+    snapshot_path service_file "$SERVICE_FILE" || { abort_transaction_snapshot; return 1; }
+    snapshot_path service_template_file "$SERVICE_TEMPLATE_FILE" || { abort_transaction_snapshot; return 1; }
+    snapshot_path management_bin "$MANAGEMENT_BIN" || { abort_transaction_snapshot; return 1; }
+    snapshot_path hysteria_bin "$HYSTERIA_BIN" || { abort_transaction_snapshot; return 1; }
+    snapshot_path acme_home "$ACME_HOME" || { abort_transaction_snapshot; return 1; }
+    snapshot_path hysteria_home_dir "$HYSTERIA_HOME_DIR" || { abort_transaction_snapshot; return 1; }
+    if id hysteria >/dev/null 2>&1; then printf 'hysteria_user=1\n' >>"$TRANSACTION_DIR/manifest"; else printf 'hysteria_user=0\n' >>"$TRANSACTION_DIR/manifest"; fi
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then printf 'service_active=1\n' >>"$TRANSACTION_DIR/manifest"; else printf 'service_active=0\n' >>"$TRANSACTION_DIR/manifest"; fi
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then printf 'service_enabled=1\n' >>"$TRANSACTION_DIR/manifest"; else printf 'service_enabled=0\n' >>"$TRANSACTION_DIR/manifest"; fi
+    TRANSACTION_ACTIVE="1"
+}
 
-    if [[ -n "$src" ]]; then
-        install -m 755 "$src" /usr/bin/hy2
-        return $?
-    fi
-
-    # 管道运行（bash <(curl ...)）或 /dev/fd/ 等无物理文件的情况
-    # 从 GitHub 重新下载一份作为管理命令
-    green "检测到脚本通过管道运行，正在从仓库获取脚本以安装管理命令..."
-
-    if command -v curl &>/dev/null; then
-        curl -fsL -o /usr/bin/hy2 "$REPO_URL" && chmod 755 /usr/bin/hy2
-    elif command -v wget &>/dev/null; then
-        wget -qO /usr/bin/hy2 "$REPO_URL" && chmod 755 /usr/bin/hy2
-    fi
-
-    if [[ -f /usr/bin/hy2 && -s /usr/bin/hy2 ]]; then
-        green "管理命令 hy2 安装成功！"
-        return 0
+restore_snapshot_path() {
+    local label="$1" path="$2" existed
+    existed="$(state_get_from "$TRANSACTION_DIR/manifest" "$label" 2>/dev/null || printf '0')"
+    if [[ -d "$path" && ! -L "$path" ]]; then
+        safe_remove_tree "$path" || return 1
     else
-        rm -f /usr/bin/hy2
-        red "无法自动写入 /usr/bin/hy2：下载失败。"
-        red "安装完成后请手动执行以下命令："
-        red "  curl -sL -o /usr/bin/hy2 $REPO_URL && chmod 755 /usr/bin/hy2"
+        rm -f -- "$path"
+    fi
+    if [[ "$existed" == "1" ]]; then
+        mkdir -p "$(dirname "$path")"
+        cp -a -- "$TRANSACTION_DIR/$label" "$path" || return 1
+    fi
+}
+
+rollback_transaction() {
+    [[ "$TRANSACTION_ACTIVE" == "1" ]] || return 0
+    warn "操作失败，正在恢复修改前状态。"
+    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    restore_snapshot_path config_dir "$CONFIG_DIR" || true
+    restore_snapshot_path client_dir "$CLIENT_DIR" || true
+    restore_snapshot_path service_file "$SERVICE_FILE" || true
+    restore_snapshot_path service_template_file "$SERVICE_TEMPLATE_FILE" || true
+    restore_snapshot_path management_bin "$MANAGEMENT_BIN" || true
+    restore_snapshot_path hysteria_bin "$HYSTERIA_BIN" || true
+    if [[ "$(state_get_from "$TRANSACTION_DIR/manifest" acme_home 2>/dev/null || printf '0')" == "0" && -x "$ACME_HOME/acme.sh" ]]; then
+        "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1 || true
+    fi
+    restore_snapshot_path acme_home "$ACME_HOME" || true
+    restore_snapshot_path hysteria_home_dir "$HYSTERIA_HOME_DIR" || true
+    if [[ "$(state_get_from "$TRANSACTION_DIR/manifest" hysteria_user 2>/dev/null || printf '0')" == "0" ]] && id hysteria >/dev/null 2>&1; then
+        userdel hysteria >/dev/null 2>&1 || true
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ -f "$SERVICE_FILE" ]]; then
+        if [[ "$(state_get_from "$TRANSACTION_DIR/manifest" service_enabled 2>/dev/null || printf '0')" == "1" ]]; then
+            systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        else
+            systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        fi
+        if [[ "$(state_get_from "$TRANSACTION_DIR/manifest" service_active 2>/dev/null || printf '0')" == "1" ]]; then
+            systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || true
+        else
+            systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+        fi
+    fi
+    if [[ "$TRANSACTION_DIR" == /tmp/hy2-transaction.* ]]; then safe_remove_tree "$TRANSACTION_DIR" || true; fi
+    TRANSACTION_DIR=""; TRANSACTION_ACTIVE="0"
+}
+
+commit_transaction() {
+    [[ "$TRANSACTION_ACTIVE" == "1" ]] || return 0
+    if [[ "$TRANSACTION_DIR" == /tmp/hy2-transaction.* ]]; then safe_remove_tree "$TRANSACTION_DIR" || true; fi
+    TRANSACTION_DIR=""; TRANSACTION_ACTIVE="0"
+}
+
+on_signal() {
+    printf '\n' >&2
+    rollback_transaction
+    error "操作已中止。"
+    exit 130
+}
+trap on_signal INT TERM
+
+tcp_port_in_use() {
+    local port="$1"
+    ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .
+}
+
+select_acme_challenge_port() {
+    if ! tcp_port_in_use 443; then
+        ACME_CHALLENGE_PORT="443"
+    elif ! tcp_port_in_use 80; then
+        ACME_CHALLENGE_PORT="80"
+    else
+        error "TCP 443 和 TCP 80 都被占用，无法自动完成 ACME 验证。"
         return 1
     fi
 }
 
-realip(){
-    local source
-    # 多源 fallback：任一源返回有效 IP 即用，避免单点依赖某个服务
-    for source in "https://ip.sb" "https://api.ipify.org" "https://ifconfig.me"; do
-        ip=$(curl -s4m8 "$source" -k 2>/dev/null | tr -d '\r\n[:space:]')
-        [[ -n $ip ]] && break
-    done
-    if [[ -z $ip ]]; then
-        # IPv6 兜底
-        for source in "https://ip.sb" "https://api.ipify.org" "https://ifconfig.me"; do
-            ip=$(curl -s6m8 "$source" -k 2>/dev/null | tr -d '\r\n[:space:]')
-            [[ -n $ip ]] && break
-        done
-    fi
-    if [[ -z $ip ]]; then
-        red "无法获取服务器公网 IP，请检查网络。"
-        exit 1
-    fi
-}
-
-save_iptables_rules(){
-    if [[ $SYSTEM == "CentOS" ]]; then
-        if [[ -f /usr/libexec/iptables/iptables.init ]]; then
-            service iptables save >/dev/null 2>&1
-            service ip6tables save >/dev/null 2>&1
+ensure_cron_available() {
+    if ! has_cmd crontab; then
+        info "安装证书自动续期所需的 cron。"
+        if [[ "$PACKAGE_FAMILY" == "apt" ]]; then
+            apt-get update -y || return 1
+            apt-get install -y cron || return 1
         else
-            iptables-save > /etc/sysconfig/iptables 2>/dev/null
-            ip6tables-save > /etc/sysconfig/ip6tables 2>/dev/null
+            local manager="dnf"; has_cmd dnf || manager="yum"
+            "$manager" install -y cronie || return 1
         fi
+    fi
+    has_cmd crontab || { error "未找到 crontab，无法保证证书自动续期。"; return 1; }
+    if systemctl cat cron.service >/dev/null 2>&1; then
+        systemctl enable --now cron.service >/dev/null 2>&1 || return 1
+    elif systemctl cat crond.service >/dev/null 2>&1; then
+        systemctl enable --now crond.service >/dev/null 2>&1 || return 1
     else
-        netfilter-persistent save >/dev/null 2>&1
+        error "未找到 cron/crond 服务，无法保证证书自动续期。"
+        return 1
     fi
 }
 
-install_iptables_persistent(){
-    if [[ $SYSTEM == "CentOS" ]]; then
-        ${PACKAGE_INSTALL[int]} iptables-services
-        systemctl enable iptables >/dev/null 2>&1
-        systemctl enable ip6tables >/dev/null 2>&1
-        systemctl start iptables >/dev/null 2>&1
-        systemctl start ip6tables >/dev/null 2>&1
+install_acme_client() {
+    local installer existed=0
+    [[ -x "$ACME_HOME/acme.sh" ]] && return 0
+    [[ -d "$ACME_HOME" ]] && existed=1
+    installer="$(mktemp /tmp/hy2-acme-installer.XXXXXX)" || return 1
+    curl -fL --retry 3 --connect-timeout 10 --max-time 120 https://get.acme.sh -o "$installer" || { rm -f "$installer"; return 1; }
+    grep -q 'acme.sh' "$installer" || { rm -f "$installer"; error "ACME 安装器内容异常。"; return 1; }
+    sh "$installer" --no-profile || { rm -f "$installer"; return 1; }
+    rm -f "$installer"
+    [[ -x "$ACME_HOME/acme.sh" ]] || return 1
+    [[ "$existed" == "0" ]] && ACME_OWNED="1"
+    return 0
+}
+
+certificate_pin() {
+    openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//'
+}
+
+certificate_matches_key() {
+    local cert_pub key_pub
+    cert_pub="$(openssl x509 -in "$1" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | openssl sha256 2>/dev/null)" || return 1
+    key_pub="$(openssl pkey -in "$2" -pubout -outform DER 2>/dev/null | openssl sha256 2>/dev/null)" || return 1
+    [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]]
+}
+
+certificate_matches_name() {
+    local cert="$1" name="$2"
+    if valid_ip "$name"; then
+        openssl x509 -in "$cert" -noout -checkip "$name" >/dev/null 2>&1
     else
-        # 非交互式安装 iptables-persistent
-        echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections 2>/dev/null
-        echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections 2>/dev/null
-        DEBIAN_FRONTEND=noninteractive ${PACKAGE_INSTALL[int]} iptables-persistent netfilter-persistent
+        openssl x509 -in "$cert" -noout -checkhost "$name" >/dev/null 2>&1
     fi
 }
 
-fix_permissions(){
-    if id "hysteria" &>/dev/null; then
-        chown -R hysteria:hysteria /etc/hysteria
-    fi
-    chmod 755 /etc/hysteria
-    if [[ -f /etc/hysteria/cert.crt ]]; then
-        chmod 644 /etc/hysteria/cert.crt
-    fi
-    if [[ -f /etc/hysteria/private.key ]]; then
-        chmod 600 /etc/hysteria/private.key
+validate_certificate_pair() {
+    local cert="$1" key="$2" name="${3:-}"
+    openssl x509 -in "$cert" -noout >/dev/null 2>&1 || { error "证书无法解析：$cert"; return 1; }
+    openssl pkey -in "$key" -noout >/dev/null 2>&1 || { error "私钥无法解析：$key"; return 1; }
+    certificate_matches_key "$cert" "$key" || { error "证书与私钥不匹配。"; return 1; }
+    openssl x509 -in "$cert" -checkend 3600 -noout >/dev/null 2>&1 || { error "证书已过期或将在一小时内过期。"; return 1; }
+    if [[ -n "$name" ]] && ! certificate_matches_name "$cert" "$name"; then
+        error "证书的 SAN 不包含：$name"
+        return 1
     fi
 }
 
-inst_cert(){
-    mkdir -p /etc/hysteria
+issue_acme_certificate() {
+    local identifier="$1" mode="$2" acme=("$ACME_HOME/acme.sh") challenge_args=()
+    ensure_cron_available || return 1
+    if [[ -f "$STATE_FILE" && -x "$ACME_HOME/acme.sh" ]] &&
+        [[ "$(state_get cert_mode 2>/dev/null || true)" == "$mode" ]] &&
+        [[ "$(state_get tls_sni 2>/dev/null || true)" == "$identifier" ]] &&
+        validate_certificate_pair "$CERT_FILE" "$KEY_FILE" "$identifier" &&
+        certificate_is_system_trusted "$CERT_FILE"; then
+        ACME_CHALLENGE_PORT="$(state_get acme_challenge_port 2>/dev/null || true)"
+        TLS_SNI="$identifier"; TLS_INSECURE="0"; TLS_PIN_SHA256=""
+        info "现有可信证书仍有效，继续使用并保留自动续期。"
+        return 0
+    fi
+    install_acme_client || return 1
+    select_acme_challenge_port || return 1
+    if [[ "$ACME_CHALLENGE_PORT" == "443" ]]; then challenge_args=(--alpn); else challenge_args=(--standalone); fi
 
-    green "请选择 Hysteria 2 协议的证书申请方式："
-    echo ""
-
-    echo -e " ${GREEN}1.${PLAIN} 使用自签证书 ${YELLOW}（默认，推荐）${PLAIN}"
-    echo -e "    ${PLAIN}说明：TLS 加密完整，流量特征与标准 HTTPS 无异。证书域名从通用域名池随机选取，规避固定域名特征。"
-    echo -e "          ${YELLOW}注意：自签证书未被 CA 信任，客户端需设置 insecure: true。${PLAIN}"
-    echo ""
-
-    echo -e " ${GREEN}2.${PLAIN} 使用 ACME 脚本自动申请证书"
-    echo -e "    ${PLAIN}说明：需要你拥有一个域名。脚本会自动申请并更新证书。"
-    echo -e "          ${YELLOW}注意：请确保域名 DNS 已正确解析到本机 IP。${PLAIN}"
-    echo ""
-
-    echo -e " ${GREEN}3.${PLAIN} 使用本地已有的证书文件"
-    echo -e "    ${PLAIN}说明：如果你已经拥有有效的证书文件 (crt/key)，请选择此项手动指定路径。"
-    echo ""
-
-    read -rp "请输入选项 [1-3]: " certInput
-
-    if [[ $certInput == 2 ]]; then
-        cert_path="/etc/hysteria/cert.crt"
-        key_path="/etc/hysteria/private.key"
-        # ACME申请的证书是受信任的，不需要跳过验证
-        insecure=0
-
-        if [[ -f $cert_path && -f $key_path && -s $cert_path && -s $key_path ]] && [[ -f /root/ca.log ]]; then
-            domain=$(cat /root/ca.log)
-            yellow "检测到上次申请的域名缓存（/root/ca.log）：$domain"
-            yellow "如需更换域名，请先执行：rm -f /root/ca.log，再重新运行"
-            green "正在应用已有证书：$domain"
-            hy_domain=$domain
-        else
-            WARPv4Status=$(curl -s4m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
-            WARPv6Status=$(curl -s6m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
-            if [[ $WARPv4Status =~ on|plus ]] || [[ $WARPv6Status =~ on|plus ]]; then
-                wg-quick down wgcf >/dev/null 2>&1
-                systemctl stop warp-go >/dev/null 2>&1
-                trap 'systemctl start warp-go >/dev/null 2>&1; wg-quick up wgcf >/dev/null 2>&1' EXIT
-                realip
-                systemctl start warp-go >/dev/null 2>&1
-                wg-quick up wgcf >/dev/null 2>&1
-                trap - EXIT
-            else
-                realip
-            fi
-
-            read -rp "请输入需要申请证书的域名：" domain
-            [[ -z $domain ]] && red "未输入域名，无法执行操作！" && exit 1
-            green "已输入的域名：$domain" && sleep 1
-
-            ${PACKAGE_INSTALL[int]} curl wget sudo socat openssl acl
-            if [[ $SYSTEM == "CentOS" ]]; then
-                ${PACKAGE_INSTALL[int]} cronie
-                systemctl start crond
-                systemctl enable crond
-            else
-                ${PACKAGE_INSTALL[int]} cron
-                systemctl start cron
-                systemctl enable cron
-            fi
-
-            curl -fsSL https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com || {
-                red "acme.sh 安装失败，请检查网络连接后重试"
-                exit 1
-            }
-            source ~/.bashrc
-            bash ~/.acme.sh/acme.sh --upgrade --auto-upgrade
-            bash ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-
-            if [[ -n $(echo $ip | grep ":") ]]; then
-                bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
-            else
-                bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --insecure
-            fi
-
-            bash ~/.acme.sh/acme.sh --install-cert -d "${domain}" --key-file /etc/hysteria/private.key --fullchain-file /etc/hysteria/cert.crt --ecc --reloadcmd "chown hysteria:hysteria /etc/hysteria/cert.crt /etc/hysteria/private.key 2>/dev/null || true; chmod 644 /etc/hysteria/cert.crt 2>/dev/null || true; chmod 600 /etc/hysteria/private.key 2>/dev/null || true; systemctl try-restart hysteria-server >/dev/null 2>&1 || true"
-
-            if [[ -f /etc/hysteria/cert.crt && -f /etc/hysteria/private.key ]] && [[ -s /etc/hysteria/cert.crt && -s /etc/hysteria/private.key ]]; then
-                echo "$domain" > /root/ca.log
-                install_cert_permission_helper
-                sed -i '/--cron/d' /etc/crontab >/dev/null 2>&1
-                echo "0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1" >> /etc/crontab
-
-                green "证书申请成功!"
-                hy_domain=$domain
-            else
-                red "证书申请失败！"
-                exit 1
-            fi
-        fi
-    elif [[ $certInput == 3 ]]; then
-        read -rp "请输入公钥文件 crt 的路径：" cert_path
-        read -rp "请输入密钥文件 key 的路径：" key_path
-
-        if [[ ! -f $cert_path ]]; then
-            red "证书文件不存在：$cert_path"
-            exit 1
-        fi
-        if [[ ! -f $key_path ]]; then
-            red "密钥文件不存在：$key_path"
-            exit 1
-        fi
-
-        # 自动从证书提取域名
-        domain=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed 's/.*CN = //;s/,.*//' | sed 's/.*CN=//;s/,.*//')
-        if [[ -z $domain ]]; then
-            red "无法从证书中提取域名，请确认证书文件有效"
-            exit 1
-        fi
-        green "从证书中读取到域名：$domain"
-
-        # 不搬运、不复制证书：只对用户提供的原始证书路径授予 Hysteria 读取权限。
-        grant_cert_read_permissions "$cert_path" "$key_path"
-        install_cert_permission_helper
-
-        hy_domain=$domain
-        # 用户提供的证书默认是受信任的，不需要跳过验证
-        insecure=0
-
-        green "已授予 Hysteria 读取证书文件的权限"
+    if [[ "$mode" == "ip-acme" ]]; then
+        info "申请 Let's Encrypt 短期公网 IP 证书（标识：$identifier）"
     else
-        green "将使用自签证书作为 Hysteria 2 的节点证书，域名随机池选取中..."
-
-        # 常见域名池：避免单一 "www.bing.com" 成为 DPI 特征
-        CERT_DOMAINS=(
-            "www.bing.com"
-            "cdn.cloudflare.com"
-            "update.microsoft.com"
-            "dns.google"
-            "www.msn.com"
-            "a172-64.web.telemetry.microsoft.com"
-        )
-        hy_domain="${CERT_DOMAINS[$RANDOM % ${#CERT_DOMAINS[@]}]}"
-
-        cert_path="/etc/hysteria/cert.crt"
-        key_path="/etc/hysteria/private.key"
-        openssl ecparam -genkey -name prime256v1 -out /etc/hysteria/private.key
-        openssl req -new -x509 -days 36500 -key /etc/hysteria/private.key -out /etc/hysteria/cert.crt -subj "/CN=${hy_domain}"
-        domain=$hy_domain
-        # 自签证书需要跳过验证
-        insecure=1
+        info "申请 Let's Encrypt 域名证书（标识：$identifier）"
     fi
+    "${acme[@]}" --set-default-ca --server letsencrypt >/dev/null || return 1
+    local issue_args=(--issue "${challenge_args[@]}" -d "$identifier" --server letsencrypt --keylength ec-256)
+    [[ "$mode" == "ip-acme" ]] && issue_args+=(--certificate-profile shortlived --days -3)
+    "${acme[@]}" "${issue_args[@]}" || return 1
+    "${acme[@]}" --install-cert -d "$identifier" --ecc \
+        --key-file "$KEY_FILE" --fullchain-file "$CERT_FILE" \
+        --reloadcmd "systemctl try-restart $SERVICE_NAME || true" || return 1
+    validate_certificate_pair "$CERT_FILE" "$KEY_FILE" "$identifier" || return 1
+    certificate_is_system_trusted "$CERT_FILE" || { error "ACME 返回的证书链未通过系统信任校验。"; return 1; }
+    CURRENT_CERT_FILE="$CERT_FILE"; CURRENT_KEY_FILE="$KEY_FILE"
+    TLS_SNI="$identifier"; TLS_INSECURE="0"; TLS_PIN_SHA256=""
 }
 
-inst_port_config(){
-    # 注意：不要在函数开头删除旧规则，否则交互过程中 Ctrl+C 会留下已删未加的中间态。
-    # 旧规则保留到用户确认新配置后、写入新规则前才移除，保证中断时服务不中断。
+generate_self_signed_certificate() {
+    local name="$1" san
+    mkdir -p "$CONFIG_DIR" || return 1
+    if valid_ip "$name"; then san="IP:$name"; else san="DNS:$name"; fi
+    info "生成自签名证书（客户端将使用 SHA-256 指纹校验）"
+    openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 3650 \
+        -keyout "${KEY_FILE}.new" -out "${CERT_FILE}.new" \
+        -subj "/CN=$name" -addext "subjectAltName=$san" >/dev/null 2>&1 || return 1
+    validate_certificate_pair "${CERT_FILE}.new" "${KEY_FILE}.new" "$name" || return 1
+    mv -f "${KEY_FILE}.new" "$KEY_FILE" || return 1
+    mv -f "${CERT_FILE}.new" "$CERT_FILE" || return 1
+    CURRENT_CERT_FILE="$CERT_FILE"; CURRENT_KEY_FILE="$KEY_FILE"
+    TLS_SNI="$name"; TLS_INSECURE="1"; TLS_PIN_SHA256="$(certificate_pin "$CERT_FILE")"
+    [[ -n "$TLS_PIN_SHA256" ]] || return 1
+}
 
-    echo ""
-    green "请选择端口使用模式："
-    echo -e " ${GREEN}1.${PLAIN} 端口跳跃 (Port Hopping)"
-    echo -e "    ${PLAIN}说明：自动在多个端口间切换，有效对抗运营商针对性阻断和限速，连接更稳。"
-    echo -e " ${GREEN}2.${PLAIN} 单端口模式 ${YELLOW}（默认，推荐）${PLAIN}"
-    echo ""
-    read -rp "请输入选项 [1-2]（回车默认 2）: " portMode
-    [[ -z $portMode ]] && portMode=2
+configure_existing_certificate() {
+    local source_cert="$1" source_key="$2" name="$3"
+    [[ -r "$source_cert" && -r "$source_key" ]] || { error "证书或私钥不可读。"; return 1; }
+    validate_certificate_pair "$source_cert" "$source_key" "$name" || return 1
+    certificate_is_system_trusted "$source_cert" || { error "现有证书不受系统信任；请改选【自签名 + 指纹校验】。"; return 1; }
+    mkdir -p "$CONFIG_DIR" || return 1
+    install -m 640 "$source_cert" "${CERT_FILE}.new" || return 1
+    install -m 640 "$source_key" "${KEY_FILE}.new" || { rm -f "${CERT_FILE}.new"; return 1; }
+    mv -f "${CERT_FILE}.new" "$CERT_FILE" || return 1
+    mv -f "${KEY_FILE}.new" "$KEY_FILE" || return 1
+    CURRENT_CERT_FILE="$CERT_FILE"; CURRENT_KEY_FILE="$KEY_FILE"
+    TLS_SNI="$name"; TLS_INSECURE="0"; TLS_PIN_SHA256=""
+}
 
-    if [[ $portMode == 2 ]]; then
-        while true; do
-            read -rp "设置 Hysteria 2 端口 [1-65535]（回车默认 443）：" port
-            [[ -z $port ]] && port=443
+configure_quick_certificate() {
+    CERT_MODE="ip-acme"
+    TLS_SNI="$PUBLIC_IP"
+    if issue_acme_certificate "$PUBLIC_IP" ip-acme; then
+        success "已启用可信 IP 证书，无需域名或跳过证书验证。"
+        return 0
+    fi
+    warn "可信 IP 证书申请失败，自动改用带指纹校验的自签名证书。"
+    FAILED_ACME_IDENTIFIER="$PUBLIC_IP"
+    CERT_MODE="selfsigned"; ACME_CHALLENGE_PORT=""
+    generate_self_signed_certificate "$PUBLIC_IP"
+}
 
-            if ! valid_port "$port"; then
-                red "端口必须是 1-65535 之间的数字！"
-                continue
-            fi
-            port=$((10#$port))
-
-            if is_udp_port_in_use "$port"; then
-                echo -e "${RED} $port ${PLAIN} 端口已被占用，请更换！"
-                continue
-            fi
-
-            break
-        done
-
-        firstport=""
-        endport=""
-        hop_interval=""
-        min_hop_interval=""
-        max_hop_interval=""
-
-        # 新配置已确认，此时才移除旧规则
-        remove_hy2_iptables_rules
-
-        if ! add_udp_input_rule "$port"; then
-            yellow "警告：未能自动添加防火墙放行规则，请确认服务器安全组/防火墙已放行 UDP $port。"
-        fi
-        save_port_state
-        save_iptables_rules
-
-        yellow "Hysteria 2 将运行在单端口：$port"
-
-    else
-        green "已选择端口跳跃模式。"
-        yellow "注意：请仔细检查服务器是否存在端口冲突（如Web服务的80/443等）。"
-        yellow "推荐：范围大小约 1000 个端口，位于 30000-50000 高位区间。"
-        echo ""
-
-        while true; do
-            read -rp "请输入起始端口/主端口 [建议30000-50000] (回车随机生成): " firstport
-            [[ -z $firstport ]] && firstport=$(shuf -i 30000-50000 -n 1)
-
-            if ! valid_port "$firstport"; then
-                red "起始端口必须是 1-65535 之间的数字！"
-                continue
-            fi
-            firstport=$((10#$firstport))
-
-            if [[ $firstport -ge 65535 ]]; then
-                red "端口跳跃模式下起始端口必须小于 65535！"
-                continue
-            fi
-
-            if is_udp_port_in_use "$firstport"; then
-                echo -e "${RED} $firstport ${PLAIN} 端口已被占用，请更换！"
-                continue
-            fi
-
-            break
-        done
-
-        while true; do
-            default_endport=$((firstport + 1000))
-            [[ $default_endport -gt 65535 ]] && default_endport=65535
-            read -rp "请输入结束端口 (回车默认为 起始端口+1000 -> $default_endport): " endport
-            [[ -z $endport ]] && endport=$default_endport
-
-            if ! valid_port "$endport"; then
-                red "结束端口必须是 1-65535 之间的数字！"
-                continue
-            fi
-            endport=$((10#$endport))
-
-            if [[ $firstport -ge $endport ]]; then
-                red "起始端口必须小于结束端口！"
-                continue
-            fi
-
-            if ! check_udp_range_conflict "$firstport" "$endport"; then
-                continue
-            fi
-
-            break
-        done
-
-        # 设置端口跳跃间隔
-        echo ""
-        green "请选择端口跳跃时间模式："
-        echo -e " ${GREEN}1.${PLAIN} 固定跳跃时间 ${YELLOW}（默认）${PLAIN}"
-        echo -e " ${GREEN}2.${PLAIN} 随机跳跃时间"
-        echo -e "    ${YELLOW}注意：低版本的代理软件可能不支持随机跳跃时间，Xray 内核系列可能不支持。${PLAIN}"
-        echo ""
-        read -rp "请输入选项 [1-2]: " hopTimeMode
-
-        if [[ $hopTimeMode == 2 ]]; then
-            hop_interval=""
-            while true; do
-                read -rp "请输入最低跳跃时间秒数 [默认10]: " min_hop_interval
-                [[ -z $min_hop_interval ]] && min_hop_interval=10
-                read -rp "请输入最高跳跃时间秒数 [默认60]: " max_hop_interval
-                [[ -z $max_hop_interval ]] && max_hop_interval=60
-
-                if ! valid_hop_interval "$min_hop_interval"; then
-                    red "最低跳跃时间必须是数字，且至少为 5 秒！"
-                    continue
-                fi
-                min_hop_interval=$((10#$min_hop_interval))
-
-                if ! is_number "$max_hop_interval"; then
-                    red "最高跳跃时间必须是数字！"
-                    continue
-                fi
-                max_hop_interval=$((10#$max_hop_interval))
-
-                if [[ $max_hop_interval -le $min_hop_interval ]]; then
-                    red "最高跳跃时间必须大于最低跳跃时间，不能等于或小于！"
-                    continue
-                fi
-
-                break
-            done
-        else
-            min_hop_interval=""
-            max_hop_interval=""
-            while true; do
-                read -rp "请输入端口跳跃间隔秒数 [默认30]: " hop_interval
-                [[ -z $hop_interval ]] && hop_interval=30
-
-                if ! valid_hop_interval "$hop_interval"; then
-                    red "端口跳跃间隔必须是数字，且至少为 5 秒！"
-                    continue
-                fi
-                hop_interval=$((10#$hop_interval))
-
-                break
-            done
-        fi
-
-        port=$firstport
-
-        # 新配置已确认，此时才移除旧规则
-        remove_hy2_iptables_rules
-
-        if ! add_port_hop_redirect_rule "$firstport:$endport" "$port"; then
-            red "端口跳跃转发规则添加失败，请确认 iptables/ip6tables 可用。"
-            return 1
-        fi
-        if ! add_udp_input_rule "$firstport:$endport"; then
-            yellow "警告：未能自动添加防火墙放行规则，请确认服务器安全组/防火墙已放行 UDP $firstport-$endport。"
-        fi
-        save_port_state
-        save_iptables_rules
-
-        if [[ -n $min_hop_interval && -n $max_hop_interval ]]; then
-            yellow "端口跳跃设置完成：$firstport - $endport (主监听端口: $port, 随机跳跃间隔: ${min_hop_interval}-${max_hop_interval}s)"
-        else
-            yellow "端口跳跃设置完成：$firstport - $endport (主监听端口: $port, 跳跃间隔: ${hop_interval}s)"
+cleanup_previous_acme_certificate() {
+    local previous_mode="$1" previous_identifier="$2" remaining
+    [[ "$previous_mode" == "ip-acme" || "$previous_mode" == "domain-acme" ]] || return 0
+    [[ -n "$previous_identifier" ]] || return 0
+    if [[ "$previous_mode" == "$CERT_MODE" && "$previous_identifier" == "$TLS_SNI" ]]; then return 0; fi
+    [[ -x "$ACME_HOME/acme.sh" ]] || return 0
+    "$ACME_HOME/acme.sh" --remove -d "$previous_identifier" --ecc >/dev/null 2>&1 || true
+    if [[ "$CERT_MODE" != "ip-acme" && "$CERT_MODE" != "domain-acme" && "$ACME_OWNED" == "1" ]]; then
+        remaining="$("$ACME_HOME/acme.sh" --list 2>/dev/null | awk 'NR > 1 && NF {count++} END {print count+0}')"
+        if [[ "$remaining" == "0" ]]; then
+            "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1 || true
+            [[ -d "$ACME_HOME" ]] && safe_remove_tree "$ACME_HOME" || true
+            ACME_OWNED="0"
         fi
     fi
 }
 
-inst_pwd(){
-    read -rp "设置 Hysteria 2 密码（回车跳过为随机字符）：" auth_pwd
-    [[ -z $auth_pwd ]] && auth_pwd=$(generate_password)
-    yellow "使用在 Hysteria 2 节点的密码为：$auth_pwd"
-}
-
-inst_site(){
-    echo ""
-    green "设置 Hysteria 2 伪装形式："
-
-    echo -e " ${GREEN}1.${PLAIN} 返回 403 Forbidden 页面 ${YELLOW}（默认，强烈推荐）${PLAIN}"
-    echo -e "    ${PLAIN}说明：模拟 Nginx 私有服务器拒绝访问。${GREEN}性能最优，CPU占用最低，隐蔽性极佳。${PLAIN}"
-    echo ""
-
-    echo -e " ${GREEN}2.${PLAIN} 伪装成其他网页 (Proxy 模式)"
-    echo -e "    ${PLAIN}说明：反代目标网站。${RED}不推荐！会消耗额外 CPU/带宽，容易被识别为跳板攻击，伪装效果往往不如静态页面。${PLAIN}"
-    echo ""
-
-    read -rp "请输入选项 [1-2]: " masqInput
-
-    if [[ $masqInput == 2 ]]; then
-        masq_type="proxy"
-        read -rp "请输入 Hysteria 2 的伪装网站地址 （去除https://） [默认首尔大学]：" proxysite
-        proxysite=$(strip_url_scheme "$proxysite")
-        [[ -z $proxysite ]] && proxysite="en.snu.ac.kr"
-        yellow "Hysteria 2 将伪装成：$proxysite (性能较低)"
-    else
-        masq_type="string"
-        proxysite=""
-        green "Hysteria 2 将使用 403 Forbidden 页面作为伪装 (性能最优)"
-    fi
-}
-
-inst_bandwidth(){
-    echo ""
-    green "设置服务端带宽限制 (速度限制)："
-    echo -e " ${GREEN}1.${PLAIN} 开启 100 Mbps 限制"
-    echo -e "    ${PLAIN}说明：${GREEN}100M 对于 4K 视频绰绰有余。${PLAIN}保持带宽克制能降低被运营商 QoS 的风险。"
-    echo -e " ${GREEN}2.${PLAIN} 不限制带宽 ${YELLOW}（默认，推荐）${PLAIN}"
-    echo -e "    ${PLAIN}说明：带宽由客户端自控，客户端设多少跑多少。适合自用场景。"
-    echo ""
-
-    read -rp "请输入选项 [1-2]（回车默认 2）: " bwInput
-    [[ -z $bwInput ]] && bwInput=2
-
-    if [[ $bwInput == 2 ]]; then
-        limit_bandwidth="no"
-        bandwidth_value=""
-        yellow "已选择：不限制带宽（客户端自控）"
-    else
-        limit_bandwidth="yes"
-        bandwidth_value="100"
-        yellow "已选择：限制服务端带宽为 100 Mbps (上下行)"
-    fi
-}
-
-inst_obfs(){
-    echo ""
-    green "设置 QUIC 流量混淆 (Obfuscation) 模式："
-    echo -e " ${GREEN}1.${PLAIN} 启用 Salamander 混淆 ${YELLOW}（默认，强烈推荐）${PLAIN}"
-    echo -e "    ${PLAIN}说明：将 QUIC 包伪装成随机 UDP 流量，有效绕过 2026 年后的 QUIC 深度检测。"
-    echo -e "          ${YELLOW}注意：启用后服务不再兼容标准 HTTP/3 连接。${PLAIN}"
-    echo ""
-    echo -e " ${GREEN}2.${PLAIN} 不使用混淆"
-    echo -e "    ${PLAIN}说明：流量特征为标准 QUIC/HTTP3。如果线路不针对 QUIC 限速则速度更快，但隐蔽性较差。"
-    echo ""
-
-    read -rp "请输入选项 [1-2]（回车默认 1）: " obfsInput
-    [[ -z $obfsInput ]] && obfsInput=1
-
-    if [[ $obfsInput == 1 ]]; then
-        OBFS_ENABLED=1
-        OBFS_TYPE="salamander"
-        read -rp "设置混淆密码（回车跳过为随机字符）: " obfs_pwd_input
-        if [[ -z $obfs_pwd_input ]]; then
-            OBFS_PASSWORD=$(generate_password)
-        else
-            OBFS_PASSWORD=$obfs_pwd_input
+cleanup_failed_acme_attempt() {
+    local remaining
+    [[ -n "$FAILED_ACME_IDENTIFIER" && -x "$ACME_HOME/acme.sh" ]] || return 0
+    "$ACME_HOME/acme.sh" --remove -d "$FAILED_ACME_IDENTIFIER" --ecc >/dev/null 2>&1 || true
+    if [[ "$CERT_MODE" != "ip-acme" && "$CERT_MODE" != "domain-acme" && "$ACME_OWNED" == "1" ]]; then
+        remaining="$("$ACME_HOME/acme.sh" --list 2>/dev/null | awk 'NR > 1 && NF {count++} END {print count+0}')"
+        if [[ "$remaining" == "0" ]]; then
+            "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1 || true
+            [[ -d "$ACME_HOME" ]] && safe_remove_tree "$ACME_HOME" || true
+            ACME_OWNED="0"
         fi
-        yellow "混淆密码：$OBFS_PASSWORD"
-        green "已启用 Salamander 混淆 (流量伪装为随机 UDP)"
-    else
-        OBFS_ENABLED=0
-        OBFS_TYPE=""
-        OBFS_PASSWORD=""
-        green "不启用混淆 (流量特征为标准 QUIC/HTTP3)"
     fi
+    FAILED_ACME_IDENTIFIER=""
 }
 
-generate_config(){
-    # 如果已有配置，改前备份
-    if [[ -f /etc/hysteria/config.yaml ]]; then
-        local bak_file="/etc/hysteria/config.yaml.bak.$(date +%s)"
-        cp /etc/hysteria/config.yaml "$bak_file" 2>/dev/null || true
-        chmod 600 "$bak_file" 2>/dev/null || true
-    fi
+save_installer_state() {
+    local temp="${STATE_FILE}.new.$$"
+    {
+        printf 'version=%s\n' "$SCRIPT_VERSION"
+        printf 'server_address=%s\n' "$SERVER_ADDRESS"
+        printf 'public_ip=%s\n' "$PUBLIC_IP"
+        printf 'server_port=%s\n' "$SERVER_PORT"
+        printf 'auth_password=%s\n' "$AUTH_PASSWORD"
+        printf 'obfs_password=%s\n' "$OBFS_PASSWORD"
+        printf 'cert_mode=%s\n' "$CERT_MODE"
+        printf 'tls_sni=%s\n' "$TLS_SNI"
+        printf 'tls_insecure=%s\n' "$TLS_INSECURE"
+        printf 'tls_pin_sha256=%s\n' "$TLS_PIN_SHA256"
+        printf 'acme_challenge_port=%s\n' "$ACME_CHALLENGE_PORT"
+        printf 'acme_owned=%s\n' "$ACME_OWNED"
+        printf 'hysteria_user_owned=%s\n' "$HYSTERIA_USER_OWNED"
+        printf 'hysteria_core_owned=%s\n' "$HYSTERIA_CORE_OWNED"
+    } >"$temp" || return 1
+    chmod 600 "$temp" || return 1
+    mv -f "$temp" "$STATE_FILE"
+}
 
-    mkdir -p /etc/hysteria
-
-    yaml_cert_path=$(yaml_escape "$cert_path")
-    yaml_key_path=$(yaml_escape "$key_path")
-    yaml_auth_pwd=$(yaml_escape "$auth_pwd")
-    yaml_proxy_url=$(yaml_escape "https://$proxysite")
-
-    cat << EOF > /etc/hysteria/config.yaml
-listen: :$port
+render_server_config() {
+    local output="$1"
+    cat >"$output" <<EOF
+# Managed by hy2 installer v${SCRIPT_VERSION}
+listen: :${SERVER_PORT}
 
 tls:
-  cert: $yaml_cert_path
-  key: $yaml_key_path
-
-quic:
-  initStreamReceiveWindow: 8388608
-  maxStreamReceiveWindow: 8388608
-  initConnReceiveWindow: 20971520
-  maxConnReceiveWindow: 20971520
+  cert: ${CERT_FILE}
+  key: ${KEY_FILE}
 
 auth:
   type: password
-  password: $yaml_auth_pwd
+  password: $(yaml_quote "$AUTH_PASSWORD")
 
-EOF
-
-    if [[ $OBFS_ENABLED == 1 ]]; then
-        yaml_obfs_pwd=$(yaml_escape "$OBFS_PASSWORD")
-        cat << EOF >> /etc/hysteria/config.yaml
 obfs:
-  type: $OBFS_TYPE
-  $OBFS_TYPE:
-    password: $yaml_obfs_pwd
+  type: salamander
+  salamander:
+    password: $(yaml_quote "$OBFS_PASSWORD")
 
-EOF
-    fi
-
-    if [[ $limit_bandwidth == "yes" ]]; then
-        cat << EOF >> /etc/hysteria/config.yaml
-bandwidth:
-  up: ${bandwidth_value:-100} mbps
-  down: ${bandwidth_value:-100} mbps
-
-EOF
-    fi
-
-    cat << EOF >> /etc/hysteria/config.yaml
 masquerade:
-EOF
-    if [[ $masq_type == "proxy" ]]; then
-        cat << EOF >> /etc/hysteria/config.yaml
-  type: proxy
-  proxy:
-    url: $yaml_proxy_url
-    rewriteHost: true
-EOF
-    else
-        cat << EOF >> /etc/hysteria/config.yaml
   type: string
   string:
-    content: "<h1>403 Forbidden</h1><p>You don't have permission to access this resource.</p><hr><address>Nginx</address>"
+    content: "Not Found"
     headers:
-      Content-Type: text/html; charset=utf-8
-      Server: nginx
-    statusCode: 403
+      content-type: "text/plain; charset=utf-8"
+      cache-control: "no-store"
+    statusCode: 404
+
+sniff:
+  enable: true
+  timeout: 2s
+  rewriteDomain: false
 EOF
-    fi
 }
 
-generate_client_config(){
-    realip
-
-    if [[ -n $firstport && -n $endport ]]; then
-        server_port_string="$port,$firstport-$endport"
-    else
-        server_port_string=$port
-    fi
-
-    if [[ -n $(echo $ip | grep ":") ]]; then
-        last_ip="[$ip]"
-    else
-        last_ip=$ip
-    fi
-
-    # 根据 insecure 变量设置布尔值
-    if [[ $insecure == 1 ]]; then
-        insecure_bool="true"
-    else
-        insecure_bool="false"
-    fi
-
-    mkdir -p /root/hy
-
-    yaml_server=$(yaml_escape "$last_ip:$server_port_string")
-    yaml_auth_pwd=$(yaml_escape "$auth_pwd")
-    yaml_hy_domain=$(yaml_escape "$hy_domain")
-    yaml_obfs_pwd=$(yaml_escape "$OBFS_PASSWORD")
-    json_server=$(json_escape "$last_ip:$server_port_string")
-    json_auth_pwd=$(json_escape "$auth_pwd")
-    json_hy_domain=$(json_escape "$hy_domain")
-    json_obfs_pwd=$(json_escape "$OBFS_PASSWORD")
-    encoded_pwd=$(urlencode "$auth_pwd")
-    encoded_sni=$(urlencode "$hy_domain")
-    encoded_obfs_pwd=$(urlencode "$OBFS_PASSWORD")
-
-    # 生成 YAML 客户端配置
-    cat << EOF > /root/hy/hy-client.yaml
-server: $yaml_server
-
-auth: $yaml_auth_pwd
-
-tls:
-  sni: $yaml_hy_domain
-  insecure: $insecure_bool
-EOF
-
-    if [[ $OBFS_ENABLED == 1 ]]; then
-        cat << EOF >> /root/hy/hy-client.yaml
-
-obfs:
-  type: $OBFS_TYPE
-  $OBFS_TYPE:
-    password: $yaml_obfs_pwd
-EOF
-    fi
-
-    cat << EOF >> /root/hy/hy-client.yaml
-
-quic:
-  initStreamReceiveWindow: 8388608
-  maxStreamReceiveWindow: 8388608
-  initConnReceiveWindow: 20971520
-  maxConnReceiveWindow: 20971520
-
-# ★ Hysteria 2 的速度核心：Brutal 拥塞控制
-# 请根据你的实际网速设置以下值（建议设为实际带宽的 70-80%）
-# 不设置则回退到标准 BBR，速度优势无法发挥
-# 示例：
-# bandwidth:
-#   up: 30 mbps
-#   down: 100 mbps
-
-fastOpen: true
-
-socks5:
-  listen: 127.0.0.1:5678
-
-EOF
-
-    # 仅在端口跳跃模式下添加 transport 配置
-    if [[ -n $firstport && -n $endport ]]; then
-        cat << EOF >> /root/hy/hy-client.yaml
-transport:
-  type: udp
-  udp:
-EOF
-        if [[ -n $min_hop_interval && -n $max_hop_interval ]]; then
-            cat << EOF >> /root/hy/hy-client.yaml
-    minHopInterval: ${min_hop_interval:-10}s
-    maxHopInterval: ${max_hop_interval:-60}s
-EOF
-        else
-            cat << EOF >> /root/hy/hy-client.yaml
-    hopInterval: ${hop_interval:-30}s
-EOF
-        fi
-    fi
-
-    # 生成 JSON 配置
-    if [[ -n $firstport && -n $endport ]]; then
-        if [[ -n $min_hop_interval && -n $max_hop_interval ]]; then
-            cat << EOF > /root/hy/hy-client.json
-{
-  "server": "$json_server",
-  "auth": "$json_auth_pwd",
-  "tls": {
-    "sni": "$json_hy_domain",
-    "insecure": $insecure_bool
-  },
-EOF
-            if [[ $OBFS_ENABLED == 1 ]]; then
-                cat << EOF >> /root/hy/hy-client.json
-  "obfs": {
-    "type": "$OBFS_TYPE",
-    "$OBFS_TYPE": {
-      "password": "$json_obfs_pwd"
-    }
-  },
-EOF
-            fi
-            cat << EOF >> /root/hy/hy-client.json
-  "quic": {
-    "initStreamReceiveWindow": 8388608,
-    "maxStreamReceiveWindow": 8388608,
-    "initConnReceiveWindow": 20971520,
-    "maxConnReceiveWindow": 20971520
-  },
-  "socks5": {
-    "listen": "127.0.0.1:5678"
-  },
-  "transport": {
-    "type": "udp",
-    "udp": {
-      "minHopInterval": "${min_hop_interval:-10}s",
-      "maxHopInterval": "${max_hop_interval:-60}s"
-    }
-  }
-}
-EOF
-        else
-            cat << EOF > /root/hy/hy-client.json
-{
-  "server": "$json_server",
-  "auth": "$json_auth_pwd",
-  "tls": {
-    "sni": "$json_hy_domain",
-    "insecure": $insecure_bool
-  },
-EOF
-            if [[ $OBFS_ENABLED == 1 ]]; then
-                cat << EOF >> /root/hy/hy-client.json
-  "obfs": {
-    "type": "$OBFS_TYPE",
-    "$OBFS_TYPE": {
-      "password": "$json_obfs_pwd"
-    }
-  },
-EOF
-            fi
-            cat << EOF >> /root/hy/hy-client.json
-  "quic": {
-    "initStreamReceiveWindow": 8388608,
-    "maxStreamReceiveWindow": 8388608,
-    "initConnReceiveWindow": 20971520,
-    "maxConnReceiveWindow": 20971520
-  },
-  "socks5": {
-    "listen": "127.0.0.1:5678"
-  },
-  "transport": {
-    "type": "udp",
-    "udp": {
-      "hopInterval": "${hop_interval:-30}s"
-    }
-  }
-}
-EOF
-        fi
-    else
-        cat << EOF > /root/hy/hy-client.json
-{
-  "server": "$json_server",
-  "auth": "$json_auth_pwd",
-  "tls": {
-    "sni": "$json_hy_domain",
-    "insecure": $insecure_bool
-  },
-EOF
-        if [[ $OBFS_ENABLED == 1 ]]; then
-            cat << EOF >> /root/hy/hy-client.json
-  "obfs": {
-    "type": "$OBFS_TYPE",
-    "$OBFS_TYPE": {
-      "password": "$json_obfs_pwd"
-    }
-  },
-EOF
-        fi
-        cat << EOF >> /root/hy/hy-client.json
-  "quic": {
-    "initStreamReceiveWindow": 8388608,
-    "maxStreamReceiveWindow": 8388608,
-    "initConnReceiveWindow": 20971520,
-    "maxConnReceiveWindow": 20971520
-  },
-  "socks5": {
-    "listen": "127.0.0.1:5678"
-  }
-}
-EOF
-    fi
-
-    # 生成订阅链接 - 按照标准格式
-    obfs_url_part=""
-    if [[ $OBFS_ENABLED == 1 ]]; then
-        obfs_url_part="&obfs=$OBFS_TYPE&obfs-password=${encoded_obfs_pwd}"
-    fi
-
-    if [[ -n $firstport && -n $endport ]]; then
-        # 端口跳跃模式
-        if [[ -n $min_hop_interval && -n $max_hop_interval ]]; then
-            url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${min_hop_interval:-10}-${max_hop_interval:-60}&insecure=${insecure}&mport=${firstport}-${endport}&sni=${encoded_sni}${obfs_url_part}#Hysteria2"
-        else
-            url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${hop_interval:-30}&insecure=${insecure}&mport=${firstport}-${endport}&sni=${encoded_sni}${obfs_url_part}#Hysteria2"
-        fi
-    else
-        # 单端口模式
-        url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&insecure=${insecure}&sni=${encoded_sni}${obfs_url_part}#Hysteria2"
-    fi
-
-    echo "$url" > /root/hy/url.txt
+rotate_backups() {
+    local old
+    [[ -d "$BACKUP_DIR" ]] || return 0
+    while (( $(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.yaml' | wc -l) > 3 )); do
+        old="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.yaml' -printf '%T@ %p\n' 2>/dev/null | sort -n | head -n1 | cut -d' ' -f2-)"
+        [[ -n "$old" && "$old" == "$BACKUP_DIR"/* ]] || break
+        rm -f -- "$old"
+    done
 }
 
-read_current_config(){
-    if [[ -f /etc/hysteria/config.yaml ]]; then
-        # 端口解析：支持 ":443"、"0.0.0.0:443"、"[::]:443" 三种格式
-        port=$(grep "^listen:" /etc/hysteria/config.yaml | sed 's/^listen:[[:space:]]*//' | sed 's/.*://')
-        cert_path=$(yaml_unescape "$(grep "^[[:space:]]*cert:" /etc/hysteria/config.yaml | sed 's/^[[:space:]]*cert:[[:space:]]*//')")
-        key_path=$(yaml_unescape "$(grep "^[[:space:]]*key:" /etc/hysteria/config.yaml | sed 's/^[[:space:]]*key:[[:space:]]*//')")
-        auth_pwd=$(yaml_unescape "$(grep "^[[:space:]]*password:" /etc/hysteria/config.yaml | sed 's/^[[:space:]]*password:[[:space:]]*//')")
-
-        # 解析混淆配置
-        obfs_type_line=$(grep "^obfs:" /etc/hysteria/config.yaml | head -1)
-        if [[ -n $obfs_type_line ]]; then
-            OBFS_ENABLED=1
-            obfs_type_sub=$(grep -A2 "^obfs:" /etc/hysteria/config.yaml | grep "type:" | head -1 | awk '{print $2}')
-            OBFS_TYPE="${obfs_type_sub:-salamander}"
-            # 读取子类型下的 password
-            if grep -q "^  $OBFS_TYPE:" /etc/hysteria/config.yaml 2>/dev/null; then
-                OBFS_PASSWORD=$(yaml_unescape "$(grep -A1 "^  $OBFS_TYPE:" /etc/hysteria/config.yaml | grep "password:" | sed 's/^[[:space:]]*password:[[:space:]]*//')")
-            else
-                OBFS_PASSWORD=""
-            fi
-        else
-            OBFS_ENABLED=0
-            OBFS_TYPE=""
-            OBFS_PASSWORD=""
-        fi
-
-        if grep -q "type: proxy" /etc/hysteria/config.yaml; then
-            masq_type="proxy"
-            proxysite=$(yaml_unescape "$(grep "^[[:space:]]*url:" /etc/hysteria/config.yaml | sed 's/^[[:space:]]*url:[[:space:]]*//')")
-            proxysite=$(echo "$proxysite" | sed 's#^https://##')
-        else
-            masq_type="string"
-            proxysite=""
-        fi
-
-        if grep -q "bandwidth:" /etc/hysteria/config.yaml; then
-            limit_bandwidth="yes"
-            bandwidth_value=$(grep "up:" /etc/hysteria/config.yaml | head -1 | awk '{print $2}')
-        else
-            limit_bandwidth="no"
-            bandwidth_value=""
-        fi
-
-        if [[ -f /root/hy/hy-client.yaml ]]; then
-            hy_domain=$(yaml_unescape "$(grep "^[[:space:]]*sni:" /root/hy/hy-client.yaml | sed 's/^[[:space:]]*sni:[[:space:]]*//')")
-            # 读取跳跃间隔
-            hop_interval=$(grep "hopInterval:" /root/hy/hy-client.yaml | awk '{print $2}' | sed 's/s$//')
-            min_hop_interval=$(grep "minHopInterval:" /root/hy/hy-client.yaml | awk '{print $2}' | sed 's/s$//')
-            max_hop_interval=$(grep "maxHopInterval:" /root/hy/hy-client.yaml | awk '{print $2}' | sed 's/s$//')
-            # 读取 insecure 设置
-            insecure_value=$(grep "insecure:" /root/hy/hy-client.yaml | awk '{print $2}')
-            if [[ $insecure_value == "true" ]]; then
-                insecure=1
-            else
-                insecure=0
-            fi
-        else
-            hy_domain=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed 's/.*CN = //;s/,.*//' | sed 's/.*CN=//;s/,.*//')
-            # 兜底：从域名池随机选取，与自签证书逻辑保持一致
-            if [[ -z $hy_domain ]]; then
-                CERT_DOMAINS_FALLBACK=("www.bing.com" "cdn.cloudflare.com" "update.microsoft.com" "dns.google" "www.msn.com")
-                hy_domain="${CERT_DOMAINS_FALLBACK[$RANDOM % ${#CERT_DOMAINS_FALLBACK[@]}]}"
-            fi
-            hop_interval=30
-            min_hop_interval=""
-            max_hop_interval=""
-            # 自签证书的 issuer 和 subject 相同，据此判断 insecure
-            cert_subject=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null)
-            cert_issuer=$(openssl x509 -in "$cert_path" -noout -issuer 2>/dev/null)
-            if [[ -n "$cert_subject" && "$cert_subject" == "$cert_issuer" ]]; then
-                insecure=1
-            else
-                insecure=0
-            fi
-        fi
-
-        # 优先读取脚本自己的端口状态文件，避免误读系统里其他服务的 iptables 规则。
-        if ! load_port_state; then
-            port_hop_rule=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -F "$IPTABLES_NAT_COMMENT" | head -n 1)
-            port_range=$(echo "$port_hop_rule" | sed -nE 's/.*--dport ([0-9]+):([0-9]+).*/\1:\2/p')
-            if [[ -n $port_range ]]; then
-                firstport=$(echo "$port_range" | cut -d: -f1)
-                endport=$(echo "$port_range" | cut -d: -f2)
-            else
-                firstport=""
-                endport=""
-            fi
-        fi
-
-        return 0
-    else
-        return 1
+activate_server_config() {
+    local new_config="${CONFIG_FILE}.new.$$" backup
+    render_server_config "$new_config" || return 1
+    if [[ -f "$CONFIG_FILE" ]]; then
+        mkdir -p "$BACKUP_DIR"
+        backup="$BACKUP_DIR/config-$(date +%Y%m%d-%H%M%S).yaml"
+        cp -a "$CONFIG_FILE" "$backup" || return 1
     fi
-}
-
-insthysteria(){
-    # 前置检测：已安装则提示（--reinstall / -f 跳过确认）
-    if systemctl is-active --quiet hysteria-server 2>/dev/null; then
-        if [[ $FORCE_INSTALL != "1" ]]; then
-            red "检测到 Hysteria 2 服务已在运行！"
-            read -rp "是否覆盖安装？(y/N): " confirm
-            [[ $confirm != "y" && $confirm != "Y" ]] && yellow "已取消安装" && exit 0
-        fi
-        systemctl stop hysteria-server
-    fi
-
-    # 获取服务器公网 IP（证书和客户端配置需要）
-    # realip 在 inst_cert (ACME 分支) 和 generate_client_config 中会再次调用，这里不需要重复执行
-
-    if [[ $SYSTEM == "CentOS" ]]; then
-        ${PACKAGE_INSTALL[int]} curl wget sudo qrencode procps openssl iproute acl
-    else
-        ${PACKAGE_INSTALL[int]} curl wget sudo qrencode procps openssl iproute2 acl
-    fi
-
-    install_iptables_persistent
-
-    bash <(curl -fsSL https://get.hy2.sh/)
-
-    if [[ ! -f /usr/local/bin/hysteria ]]; then
-        red "Hysteria 2 安装失败！"
-        exit 1
-    fi
-
-    inst_cert
-    inst_port_config
-    inst_pwd
-    inst_obfs
-    inst_site
-    inst_bandwidth
-    generate_config
-    generate_client_config
-
-    fix_permissions
-
-    systemctl daemon-reload
-    systemctl enable hysteria-server
-
-    echo "正在等待网络环境就绪..."
-    sleep 5
-    systemctl start hysteria-server
-
+    chown root:hysteria "$new_config" || return 1
+    chmod 640 "$new_config" || return 1
+    mv -f "$new_config" "$CONFIG_FILE" || return 1
+    secure_files || return 1
+    systemctl restart "$SERVICE_NAME" || return 1
     sleep 2
-    if systemctl is-active --quiet hysteria-server && [[ -f '/etc/hysteria/config.yaml' ]]; then
-        green "Hysteria 2 服务启动成功"
-    else
-        red "Hysteria 2 服务启动失败，请检查日志：journalctl -u hysteria-server -e" && exit 1
-    fi
-    red "======================================================================================"
-    green "Hysteria 2 代理服务安装完成"
-
-    green "======================================================================================"
-    green "               管理命令：${YELLOW}hy2${GREEN} (直接输入 hy2 即可)"
-    green "        输入 ${YELLOW}hy2${GREEN} 即可再次召唤本主界面，进行配置管理"
-    green "======================================================================================"
-
-    yellow "Hysteria 2 客户端 YAML 配置文件 hy-client.yaml 内容如下"
-    green "$(cat /root/hy/hy-client.yaml)"
-    yellow "Hysteria 2 客户端 JSON 配置文件 hy-client.json 内容如下"
-    green "$(cat /root/hy/hy-client.json)"
-    yellow "Hysteria 2 节点分享链接如下"
-    green "$(cat /root/hy/url.txt)"
-}
-
-unsthysteria(){
-    red "⚠️  确认卸载 Hysteria 2？此操作将删除所有配置文件和客户端信息！"
-    read -rp "确认卸载？(y/N): " confirm
-    [[ $confirm != "y" && $confirm != "Y" ]] && yellow "已取消卸载" && return
-
-    systemctl stop hysteria-server.service >/dev/null 2>&1
-    systemctl disable hysteria-server.service >/dev/null 2>&1
-    rm -f /lib/systemd/system/hysteria-server.service /lib/systemd/system/hysteria-server@.service
-    rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service
-    rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy /root/hysteria.sh /root/ca.log
-    rm -f /usr/bin/hy2 /usr/local/bin/hy2-fix-cert-perms /etc/letsencrypt/renewal-hooks/deploy/hy2-fix-cert-perms
-    remove_hy2_iptables_rules
-    save_iptables_rules
-    systemctl daemon-reload
-    green "Hysteria 2 已彻底卸载完成！"
-}
-
-starthysteria(){
-    systemctl start hysteria-server
-    systemctl enable hysteria-server >/dev/null 2>&1
-    if systemctl is-active --quiet hysteria-server; then
-        green "Hysteria 2 启动成功"
-    else
-        red "Hysteria 2 启动失败，请查看日志：journalctl -u hysteria-server -e"
+    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+        error "Hysteria 服务启动失败，最近日志如下："
+        journalctl -u "$SERVICE_NAME" -n 20 --no-pager >&2 || true
         return 1
     fi
+    rotate_backups
 }
 
-stophysteria(){
-    systemctl stop hysteria-server
-    systemctl disable hysteria-server >/dev/null 2>&1
-    green "Hysteria 2 已停止"
+client_server_value() {
+    local host="$SERVER_ADDRESS"
+    valid_ipv6 "$host" && host="[$host]"
+    printf '%s:%s' "$host" "$SERVER_PORT"
 }
 
-hysteriaswitch(){
-    yellow "请选择你需要的操作："
-    echo ""
-    echo -e " ${GREEN}1.${PLAIN} 启动 Hysteria 2"
-    echo -e " ${GREEN}2.${PLAIN} 关闭 Hysteria 2"
-    echo -e " ${GREEN}3.${PLAIN} 重启 Hysteria 2"
-    echo ""
-    read -rp "请输入选项 [1-3]: " switchInput
-    case $switchInput in
-        1 ) starthysteria ;;
-        2 ) stophysteria ;;
-        3 ) stophysteria && starthysteria ;;
-        * ) yellow "无效选项，请重新输入" ; sleep 1 ; hysteriaswitch ;;
-    esac
-}
-
-changebandwidth(){
-    if ! read_current_config; then
-        red "未找到配置文件，请先安装 Hysteria 2"
-        return 1
-    fi
-
-    echo ""
-    green "请选择带宽限速模式："
-    echo -e " ${GREEN}1.${PLAIN} 开启 100 Mbps 限制"
-    echo -e " ${GREEN}2.${PLAIN} 自定义限速数值"
-    echo -e " ${GREEN}3.${PLAIN} 关闭限速（客户端自控） ${YELLOW}（推荐）${PLAIN}"
-    echo ""
-    read -rp "请输入选项 [1-3]: " bwChange
-
-    if [[ $bwChange == 1 ]]; then
-        limit_bandwidth="yes"
-        bandwidth_value="100"
-        yellow "已设置为：100 Mbps 限速"
-    elif [[ $bwChange == 2 ]]; then
-        while true; do
-            read -rp "请输入限速数值 (单位 mbps，例如 50): " custBw
-            [[ -z $custBw ]] && custBw=100
-            if ! is_number "$custBw" || (( 10#$custBw <= 0 )); then
-                red "限速数值必须是正整数！"
-                continue
-            fi
-            custBw=$((10#$custBw))
-            break
-        done
-        limit_bandwidth="yes"
-        bandwidth_value="$custBw"
-        yellow "已设置为：$custBw Mbps 限速"
-    else
-        limit_bandwidth="no"
-        bandwidth_value=""
-        yellow "已关闭带宽限制"
-    fi
-
-    generate_config
-    fix_permissions
-    stophysteria && starthysteria
-    green "带宽限制配置已更新！"
-}
-
-changeport(){
-    if ! read_current_config; then
-        red "未找到配置文件，请先安装 Hysteria 2"
-        return 1
-    fi
-    systemctl stop hysteria-server >/dev/null 2>&1
-    inst_port_config
-    generate_config
-    generate_client_config
-    fix_permissions
-    starthysteria
-    green "Hysteria 2 端口配置已更新！"
-    showconf
-}
-
-changepasswd(){
-    if ! read_current_config; then
-        red "未找到配置文件，请先安装 Hysteria 2"
-        return 1
-    fi
-    read -rp "设置 Hysteria 2 密码（回车跳过为随机字符）：" new_pwd
-    [[ -z $new_pwd ]] && new_pwd=$(generate_password)
-    auth_pwd=$new_pwd
-    generate_config
-    generate_client_config
-    fix_permissions
-    stophysteria && starthysteria
-    green "Hysteria 2 节点密码已成功修改为：$auth_pwd"
-    showconf
-}
-
-change_cert(){
-    if ! read_current_config; then
-        red "未找到配置文件，请先安装 Hysteria 2"
-        return 1
-    fi
-    inst_cert
-    generate_config
-    generate_client_config
-    fix_permissions
-    stophysteria && starthysteria
-    green "Hysteria 2 节点证书类型已成功修改"
-    showconf
-}
-
-changeproxysite(){
-    if ! read_current_config; then
-        red "未找到配置文件，请先安装 Hysteria 2"
-        return 1
-    fi
-    inst_site
-    generate_config
-    fix_permissions
-    stophysteria && starthysteria
-    green "Hysteria 2 节点伪装形式已修改成功！"
-}
-
-changeobfs(){
-    if ! read_current_config; then
-        red "未找到配置文件，请先安装 Hysteria 2"
-        return 1
-    fi
-    inst_obfs
-    generate_config
-    generate_client_config
-    fix_permissions
-    stophysteria && starthysteria
-    green "Hysteria 2 混淆配置已更新！"
-    showconf
-}
-
-changeconf(){
-    green "Hysteria 2 配置变更选择如下:"
-    echo -e " ${GREEN}1.${PLAIN} 修改端口 (重新配置)"
-    echo -e " ${GREEN}2.${PLAIN} 修改密码"
-    echo -e " ${GREEN}3.${PLAIN} 修改证书类型"
-    echo -e " ${GREEN}4.${PLAIN} 修改伪装形式"
-    echo -e " ${GREEN}5.${PLAIN} 编辑带宽限速"
-    echo -e " ${GREEN}6.${PLAIN} 修改流量混淆 (Salamander) ${YELLOW}（新增）${PLAIN}"
-    echo ""
-    read -rp " 请选择操作 [1-6]：" confAnswer
-    case $confAnswer in
-        1 ) changeport ;;
-        2 ) changepasswd ;;
-        3 ) change_cert ;;
-        4 ) changeproxysite ;;
-        5 ) changebandwidth ;;
-        6 ) changeobfs ;;
-        * ) yellow "无效选项，请重新输入" ; sleep 1 ; changeconf ;;
-    esac
-}
-
-showconf(){
-    if [[ ! -f /root/hy/hy-client.yaml ]]; then
-        red "未找到客户端配置文件，请先安装 Hysteria 2"
-        return 1
-    fi
-    yellow "Hysteria 2 客户端 YAML 配置文件 hy-client.yaml 内容如下"
-    green "$(cat /root/hy/hy-client.yaml)"
-    yellow "Hysteria 2 客户端 JSON 配置文件 hy-client.json 内容如下"
-    green "$(cat /root/hy/hy-client.json)"
-    yellow "Hysteria 2 节点分享链接如下"
-    green "$(cat /root/hy/url.txt)"
-}
-
-show_cert_fingerprint(){
-    # 显示服务器证书的 SHA256 指纹，供客户端证书固定（pinSHA256）使用
-    if [[ ! -f /etc/hysteria/config.yaml ]]; then
-        red "未找到配置文件，请先安装 Hysteria 2"
-        return 1
-    fi
-    cert_path=$(yaml_unescape "$(grep "^[[:space:]]*cert:" /etc/hysteria/config.yaml | sed 's/^[[:space:]]*cert:[[:space:]]*//')")
-    [[ -z $cert_path ]] && cert_path="/etc/hysteria/cert.crt"
-    if [[ ! -f $cert_path ]]; then
-        red "未找到证书文件：$cert_path"
-        return 1
-    fi
-    fingerprint=$(openssl x509 -fingerprint -sha256 -noout -in "$cert_path" 2>/dev/null | sed 's/^SHA256 Fingerprint=//')
-    if [[ -z $fingerprint ]]; then
-        red "无法读取证书指纹，请确认证书文件有效"
-        return 1
-    fi
-    sni=$(yaml_unescape "$(grep "^[[:space:]]*sni:" /root/hy/hy-client.yaml 2>/dev/null | sed 's/^[[:space:]]*sni:[[:space:]]*//')")
-    echo ""
-    yellow "===================================================="
-    green "证书文件：$cert_path"
-    green "证书指纹（SHA256）："
-    echo ""
-    echo -e " ${GREEN}$fingerprint${PLAIN}"
-    echo ""
-    yellow "v2rayN 客户端设置："
-    echo " 1. 编辑 hy2 节点 → TLS 设置"
-    echo " 2. 取消勾选『跳过证书验证』"
-    echo " 3. 将上方指纹填入『证书指纹』字段（不要带 SHA256 Fingerprint= 前缀）"
-    echo ""
-    if [[ -n $sni ]]; then
-        yellow "Hysteria 2 原生客户端配置写法："
-        echo " tls:"
-        echo "   sni: $sni"
-        echo "   insecure: false"
-        echo "   pinSHA256: $fingerprint"
-    fi
-    yellow "===================================================="
-}
-
-menu() {
-    clear
-    echo "#############################################################"
-    echo -e "#                  ${GREEN}Hysteria 2 一键安装脚本${PLAIN}                  #"
-    echo "#############################################################"
-    echo ""
-    echo -e " ${GREEN}1.${PLAIN} ${GREEN}安装 Hysteria 2${PLAIN}"
-    echo -e " ${RED}2.${PLAIN} ${RED}卸载 Hysteria 2${PLAIN}"
-    echo " ------------------------------------------------------------"
-    echo -e " 3. 关闭、开启、重启 Hysteria 2"
-    echo -e " 4. 修改 Hysteria 2 配置"
-    echo -e " 5. 显示 Hysteria 2 配置文件"
-    echo " ------------------------------------------------------------"
-    echo -e " 6. 更新脚本"
-    echo -e " 7. 更新内核 (Hysteria 2)"
-    echo -e " 8. 显示证书指纹（客户端证书固定用）"
-    echo " ------------------------------------------------------------"
-    echo -e " 0. 退出脚本"
-    echo ""
-    read -rp "请输入选项 [0-8]: " menuInput
-    case $menuInput in
-        1 ) insthysteria ;;
-        2 ) unsthysteria ;;
-        3 ) hysteriaswitch ;;
-        4 ) changeconf ;;
-        5 ) showconf ;;
-        6 ) update_script ;;
-        7 ) update_hysteria_kernel ;;
-        8 ) show_cert_fingerprint ;;
-        0 ) exit 0 ;;
-        * ) yellow "无效选项，请重新输入" ; sleep 1 ; menu ;;
-    esac
-}
-
-# 更新 Hysteria 2 内核（服务端二进制）
-update_hysteria_kernel() {
-    yellow "正在检查 Hysteria 2 内核版本..."
-    local old_version=""
-    local new_version=""
-
-    if [[ -f /usr/local/bin/hysteria ]]; then
-        old_version=$(/usr/local/bin/hysteria version 2>/dev/null | head -n 1)
-        [[ -n $old_version ]] && yellow "当前版本：$old_version"
-    fi
-
-    bash <(curl -fsSL https://get.hy2.sh/) || {
-        red "内核更新失败，请检查网络后重试"
-        return 1
-    }
-
-    if [[ -f /usr/local/bin/hysteria ]]; then
-        new_version=$(/usr/local/bin/hysteria version 2>/dev/null | head -n 1)
-        if [[ -n $old_version && -n $new_version && $old_version == "$new_version" ]]; then
-            yellow "当前已是最新版本：$new_version"
+write_client_tls_block() {
+    local output="$1"
+    {
+        printf 'tls:\n'
+        printf '  sni: %s\n' "$(yaml_quote "$TLS_SNI")"
+        if [[ "$TLS_INSECURE" == "1" ]]; then
+            printf '  insecure: true\n'
+            printf '  pinSHA256: %s\n' "$(yaml_quote "$TLS_PIN_SHA256")"
         else
-            [[ -n $new_version ]] && green "更新后版本：$new_version"
+            printf '  insecure: false\n'
         fi
-        # 二进制已覆盖，重启服务使新内核生效
-        if systemctl is-active --quiet hysteria-server 2>/dev/null; then
-            systemctl try-restart hysteria-server >/dev/null 2>&1
-            green "Hysteria 2 内核已更新，服务已自动重启"
+    } >>"$output"
+}
+
+generate_client_configs() {
+    local server_value socks_file tun_file url_file uri_host uri_port query uri candidate resolved seen="|" ipv4_yaml="" ipv6_yaml=""
+    mkdir -p "$CLIENT_DIR" || return 1
+    server_value="$(client_server_value)"
+    socks_file="$CLIENT_DIR/hy-client.yaml"
+    tun_file="$CLIENT_DIR/hy-client-tun.yaml"
+    url_file="$CLIENT_DIR/url.txt"
+    rm -f "$CLIENT_DIR/hy-client.json" || return 1
+
+    {
+        printf '# Hysteria 2 client - SOCKS5 mode\n'
+        printf 'server: %s\n' "$(yaml_quote "$server_value")"
+        printf 'auth: %s\n' "$(yaml_quote "$AUTH_PASSWORD")"
+        printf 'obfs:\n  type: salamander\n  salamander:\n    password: %s\n' "$(yaml_quote "$OBFS_PASSWORD")"
+    } >"$socks_file" || return 1
+    write_client_tls_block "$socks_file" || return 1
+    cat >>"$socks_file" <<'EOF' || return 1
+socks5:
+  listen: 127.0.0.1:1080
+EOF
+    [[ -s "$socks_file" ]] || return 1
+
+    {
+        printf '# Hysteria 2 client - native TUN mode (run as administrator/root)\n'
+        printf 'server: %s\n' "$(yaml_quote "$server_value")"
+        printf 'auth: %s\n' "$(yaml_quote "$AUTH_PASSWORD")"
+        printf 'obfs:\n  type: salamander\n  salamander:\n    password: %s\n' "$(yaml_quote "$OBFS_PASSWORD")"
+    } >"$tun_file" || return 1
+    write_client_tls_block "$tun_file" || return 1
+    if ! valid_ip "$SERVER_ADDRESS" && has_cmd getent; then
+        resolved="$(getent ahosts "$SERVER_ADDRESS" 2>/dev/null | awk '{print $1}' || true)"
+    fi
+    while IFS= read -r candidate; do
+        [[ -n "$candidate" && "$seen" != *"|${candidate}|"* ]] || continue
+        if valid_ipv4 "$candidate"; then
+            ipv4_yaml+="      - ${candidate}/32"$'\n'; seen+="${candidate}|"
+        elif valid_ipv6 "$candidate"; then
+            ipv6_yaml+="      - \"${candidate}/128\""$'\n'; seen+="${candidate}|"
+        fi
+    done <<<"${PUBLIC_IP}"$'\n'"${resolved:-}"
+    cat >>"$tun_file" <<EOF || return 1
+tun:
+  name: hy2
+  mtu: 1400
+  timeout: 5m
+  address:
+    ipv4: 100.100.100.101/30
+    ipv6: 2001:db8::101/126
+  route:
+    ipv4:
+      - 0.0.0.0/0
+    ipv6:
+      - "2000::/3"
+EOF
+    [[ -s "$tun_file" ]] || return 1
+    if [[ -n "$ipv4_yaml" ]]; then printf '    ipv4Exclude:\n%s' "$ipv4_yaml" >>"$tun_file" || return 1; fi
+    if [[ -n "$ipv6_yaml" ]]; then printf '    ipv6Exclude:\n%s' "$ipv6_yaml" >>"$tun_file" || return 1; fi
+
+    uri_host="$(host_for_uri "$SERVER_ADDRESS")"
+    uri_port="$SERVER_PORT"
+    query="sni=$(uri_encode "$TLS_SNI")&insecure=${TLS_INSECURE}&obfs=salamander&obfs-password=$(uri_encode "$OBFS_PASSWORD")"
+    [[ -n "$TLS_PIN_SHA256" ]] && query+="&pinSHA256=$(uri_encode "$TLS_PIN_SHA256")"
+    uri="hysteria2://$(uri_encode "$AUTH_PASSWORD")@${uri_host}:${uri_port}/?${query}#hy2"
+    printf '%s\n' "$uri" >"$url_file" || return 1
+    chmod 600 "$socks_file" "$tun_file" "$url_file"
+}
+
+yaml_value_in_section() {
+    local section="$1" key="$2" file="$3"
+    awk -v wanted="$section" -v wanted_key="$key" '
+        /^[[:alnum:]_-]+:[[:space:]]*$/ {
+            top=$0; sub(/:.*/, "", top); in_section=(top == wanted); next
+        }
+        in_section && $0 ~ "^[[:space:]]+" wanted_key ":[[:space:]]*" {
+            sub("^[[:space:]]+" wanted_key ":[[:space:]]*", ""); print; exit
+        }
+    ' "$file"
+}
+
+yaml_password_in_section() { yaml_value_in_section "$1" password "$2"; }
+
+certificate_is_self_signed() {
+    local cert="$1" subject issuer
+    [[ -r "$cert" ]] || return 1
+    subject="$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject=//')" || return 1
+    issuer="$(openssl x509 -in "$cert" -noout -issuer -nameopt RFC2253 2>/dev/null | sed 's/^issuer=//')" || return 1
+    [[ -n "$subject" && "$subject" == "$issuer" ]]
+}
+
+certificate_is_system_trusted() {
+    local cert="$1" temp count i result=1
+    temp="$(mktemp -d /tmp/hy2-certcheck.XXXXXX)" || return 1
+    if ! awk -v prefix="$temp/part-" '
+        /-----BEGIN CERTIFICATE-----/ {part++}
+        part > 0 {print > (prefix part ".pem")}
+    ' "$cert"; then
+        safe_remove_tree "$temp" || true
+        return 1
+    fi
+    count="$(find "$temp" -maxdepth 1 -type f -name 'part-*.pem' | wc -l)"
+    if [[ "$count" =~ ^[0-9]+$ ]] && ((count >= 1)); then
+        if ((count == 1)); then
+            openssl verify "$temp/part-1.pem" >/dev/null 2>&1 && result=0
         else
-            green "Hysteria 2 内核已更新（服务未运行，无需重启）"
+            : >"$temp/chain.pem"
+            for ((i=2; i<=count; i++)); do cat "$temp/part-${i}.pem" >>"$temp/chain.pem" || break; done
+            openssl verify -untrusted "$temp/chain.pem" "$temp/part-1.pem" >/dev/null 2>&1 && result=0
         fi
-    else
-        red "更新后未找到 hysteria 二进制，内核更新失败！"
+    fi
+    safe_remove_tree "$temp" || true
+    return "$result"
+}
+
+read_current_config() {
+    local value listen has_state=0 legacy_cert legacy_key legacy_client legacy_insecure="" legacy_sni=""
+    CURRENT_CERT_FILE="$CERT_FILE"; CURRENT_KEY_FILE="$KEY_FILE"
+    if [[ -f "$STATE_FILE" ]]; then
+        has_state=1
+        SERVER_ADDRESS="$(state_get server_address 2>/dev/null || true)"
+        PUBLIC_IP="$(state_get public_ip 2>/dev/null || true)"
+        SERVER_PORT="$(state_get server_port 2>/dev/null || printf '443')"
+        AUTH_PASSWORD="$(state_get auth_password 2>/dev/null || true)"
+        OBFS_PASSWORD="$(state_get obfs_password 2>/dev/null || true)"
+        CERT_MODE="$(state_get cert_mode 2>/dev/null || printf 'selfsigned')"
+        TLS_SNI="$(state_get tls_sni 2>/dev/null || true)"
+        TLS_INSECURE="$(state_get tls_insecure 2>/dev/null || printf '1')"
+        TLS_PIN_SHA256="$(state_get tls_pin_sha256 2>/dev/null || true)"
+        ACME_CHALLENGE_PORT="$(state_get acme_challenge_port 2>/dev/null || true)"
+        ACME_OWNED="$(state_get acme_owned 2>/dev/null || printf '0')"
+        HYSTERIA_USER_OWNED="$(state_get hysteria_user_owned 2>/dev/null || printf '0')"
+        HYSTERIA_CORE_OWNED="$(state_get hysteria_core_owned 2>/dev/null || printf '0')"
+    fi
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    if [[ "$has_state" == "0" ]]; then
+        SERVER_PORT=""
+        AUTH_PASSWORD=""; OBFS_PASSWORD=""
+        TLS_SNI=""; TLS_INSECURE="0"; TLS_PIN_SHA256=""
+        legacy_cert="$(yaml_value_in_section tls cert "$CONFIG_FILE" 2>/dev/null || true)"
+        legacy_key="$(yaml_value_in_section tls key "$CONFIG_FILE" 2>/dev/null || true)"
+        legacy_cert="$(yaml_unquote "$legacy_cert")"; legacy_key="$(yaml_unquote "$legacy_key")"
+        [[ -n "$legacy_cert" ]] && CURRENT_CERT_FILE="$legacy_cert"
+        [[ -n "$legacy_key" ]] && CURRENT_KEY_FILE="$legacy_key"
+        legacy_client="$CLIENT_DIR/hy-client.yaml"
+        if [[ -f "$legacy_client" ]]; then
+            legacy_insecure="$(awk '/^[[:space:]]+insecure:[[:space:]]*/ {print $2; exit}' "$legacy_client")"
+            legacy_sni="$(awk '/^[[:space:]]+sni:[[:space:]]*/ {sub(/^[[:space:]]+sni:[[:space:]]*/, ""); print; exit}' "$legacy_client")"
+            legacy_sni="$(yaml_unquote "$legacy_sni")"
+            [[ -n "$legacy_sni" ]] && TLS_SNI="$legacy_sni"
+        fi
+        if [[ "$legacy_insecure" == "true" ]] || certificate_is_self_signed "$CURRENT_CERT_FILE"; then
+            TLS_INSECURE="1"; CERT_MODE="selfsigned"
+            TLS_PIN_SHA256="$(certificate_pin "$CURRENT_CERT_FILE")"
+        else
+            TLS_INSECURE="0"; TLS_PIN_SHA256=""; CERT_MODE="existing"
+        fi
+    fi
+    if [[ -z "$AUTH_PASSWORD" ]]; then
+        value="$(yaml_password_in_section auth "$CONFIG_FILE")"; AUTH_PASSWORD="$(yaml_unquote "$value")"
+    fi
+    if [[ -z "$OBFS_PASSWORD" ]]; then
+        value="$(yaml_password_in_section obfs "$CONFIG_FILE")"; OBFS_PASSWORD="$(yaml_unquote "$value")"
+    fi
+    if [[ -z "$SERVER_PORT" ]]; then
+        listen="$(awk '/^listen:[[:space:]]*/ {sub(/^listen:[[:space:]]*:*/, ""); print; exit}' "$CONFIG_FILE")"
+        listen="${listen##*:}"
+        SERVER_PORT="${listen%%-*}"
+    fi
+    if [[ -z "$PUBLIC_IP" ]]; then fetch_public_ip || return 1; fi
+    [[ -n "$SERVER_ADDRESS" ]] || SERVER_ADDRESS="$PUBLIC_IP"
+    [[ -n "$TLS_SNI" ]] || TLS_SNI="$SERVER_ADDRESS"
+    if [[ "$TLS_INSECURE" == "1" && -z "$TLS_PIN_SHA256" && -f "$CURRENT_CERT_FILE" ]]; then
+        TLS_PIN_SHA256="$(certificate_pin "$CURRENT_CERT_FILE")"
+    fi
+    valid_secret "$AUTH_PASSWORD" && valid_secret "$OBFS_PASSWORD" || return 1
+    [[ "$TLS_INSECURE" != "1" || -n "$TLS_PIN_SHA256" ]]
+}
+
+install_management_command() {
+    local source_path target_path
+    source_path="$(readlink -f "${BASH_SOURCE[0]}")"
+    target_path="$(readlink -f "$MANAGEMENT_BIN" 2>/dev/null || printf '%s' "$MANAGEMENT_BIN")"
+    [[ "$source_path" == "$target_path" ]] && return 0
+    atomic_install_file "$source_path" "$MANAGEMENT_BIN" 755 root root
+}
+
+print_client_result() {
+    local url
+    url="$(cat "$CLIENT_DIR/url.txt")"
+    printf '\n%bHysteria 2 已可用%b\n' "$C_GREEN" "$C_RESET"
+    printf '服务器：%s\n' "$(client_server_value)"
+    printf '分享链接：\n%s\n' "$url"
+    printf 'SOCKS5 配置：%s\n' "$CLIENT_DIR/hy-client.yaml"
+    printf '原生 TUN 配置：%s\n' "$CLIENT_DIR/hy-client-tun.yaml"
+    if [[ "$TLS_INSECURE" == "1" ]]; then
+        warn "当前为自签名证书。链接已包含证书指纹；若客户端导入后丢失 pinSHA256，请使用生成的 YAML 或切换 sing-box/官方 Hysteria 内核。"
+    fi
+    warn "脚本不会修改防火墙；请自行放行 UDP ${SERVER_PORT}${ACME_CHALLENGE_PORT:+ 和 TCP ${ACME_CHALLENGE_PORT}}。"
+}
+
+prepare_runtime() {
+    require_root || return 1
+    detect_os || return 1
+    install_dependencies || return 1
+    check_crypto_capabilities || return 1
+    if ! fetch_public_ip; then
+        error "无法取得有效公网 IP。请检查 VPS 网络后重试。"
         return 1
     fi
 }
 
-# 更新脚本
-update_script() {
-    local tmp_file="/tmp/hysteria-update.sh"
-
-    yellow "正在检查脚本更新..."
-
-    if command -v curl &>/dev/null; then
-        curl -fsL -o "$tmp_file" "$REPO_URL" || { red "下载失败"; return 1; }
-    elif command -v wget &>/dev/null; then
-        wget -qO "$tmp_file" "$REPO_URL" || { red "下载失败"; return 1; }
-    else
-        red "更新失败：未找到 curl 或 wget"
+ensure_install_scope_safe() {
+    local -a conflicts=()
+    managed_paths_are_safe || { error "检测到托管路径为符号链接或指向预期目录之外，已拒绝继续。"; return 1; }
+    has_valid_installer_state && return 0
+    if [[ -d "$CONFIG_DIR" ]] && find "$CONFIG_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .; then conflicts+=("$CONFIG_DIR"); fi
+    if [[ -d "$CLIENT_DIR" ]] && find "$CLIENT_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .; then conflicts+=("$CLIENT_DIR"); fi
+    [[ -e "$SERVICE_FILE" || -L "$SERVICE_FILE" ]] && conflicts+=("$SERVICE_FILE")
+    [[ -e "$MANAGEMENT_BIN" || -L "$MANAGEMENT_BIN" ]] && conflicts+=("$MANAGEMENT_BIN")
+    if ((${#conflicts[@]} > 0)); then
+        error "检测到没有本脚本有效状态记录的现有文件，已拒绝覆盖：${conflicts[*]}"
+        error "请先备份并移走这些文件，再重新安装。现有 Hysteria 内核本身可以直接保留。"
         return 1
     fi
-
-    if [[ ! -f "$tmp_file" || ! -s "$tmp_file" ]]; then
-        red "更新失败：无法从仓库获取脚本"
-        return 1
-    fi
-
-    # 校验：确保下载的是 bash 脚本
-    if ! head -1 "$tmp_file" | grep -qE '^#!/bin/bash'; then
-        red "更新失败：下载的文件不是有效的脚本"
-        rm -f "$tmp_file"
-        return 1
-    fi
-
-    # 安装到 /usr/bin/hy2
-    install -m 755 "$tmp_file" /usr/bin/hy2
-    green "脚本更新成功！"
-
-    # 如果当前目录有 hysteria.sh，一并更新
-    if [[ -f ./hysteria.sh ]]; then
-        cp "$tmp_file" ./hysteria.sh
-        chmod +x ./hysteria.sh
-        green "本地脚本 hysteria.sh 已同步更新"
-    fi
-
-    rm -f "$tmp_file"
-    green "请重新运行脚本以使用最新版本。"
-    exit 0
 }
 
-# 入口：参数解析
-FORCE_INSTALL=0
-case "$1" in
-    --reinstall|-f)
-        FORCE_INSTALL=1
-        insthysteria
-        rc=$?
-        install_management_command
-        exit $rc
-        ;;
-esac
+install_core_and_unit() {
+    local user_preexisting=0
+    id hysteria >/dev/null 2>&1 && user_preexisting=1
+    if [[ -x "$HYSTERIA_BIN" ]] && "$HYSTERIA_BIN" version >/dev/null 2>&1; then
+        info "保留当前可用的 Hysteria 内核；如需升级请使用菜单 7。"
+    else
+        install_hysteria_core || return 1
+        HYSTERIA_CORE_OWNED="1"
+    fi
+    ensure_service_unit || return 1
+    if [[ "$user_preexisting" == "0" ]] && id hysteria >/dev/null 2>&1; then HYSTERIA_USER_OWNED="1"; fi
+}
 
-# 入口：每次运行均同步管理命令到 /usr/bin/hy2
-# 这样无论通过哪种方式更新脚本，下次运行 hy2 即是最新版
-install_management_command
+perform_install() {
+    local cert_strategy="$1" source_cert="${2:-}" source_key="${3:-}" previous_cert_mode="" previous_sni=""
+    if [[ -f "$STATE_FILE" ]]; then
+        previous_cert_mode="$(state_get cert_mode 2>/dev/null || true)"
+        previous_sni="$(state_get tls_sni 2>/dev/null || true)"
+        ACME_OWNED="$(state_get acme_owned 2>/dev/null || printf '0')"
+        HYSTERIA_USER_OWNED="$(state_get hysteria_user_owned 2>/dev/null || printf '0')"
+        HYSTERIA_CORE_OWNED="$(state_get hysteria_core_owned 2>/dev/null || printf '0')"
+    fi
+    begin_transaction || return 1
+    if ! install_core_and_unit; then rollback_transaction; return 1; fi
 
-menu
+    case "$cert_strategy" in
+        quick) configure_quick_certificate || { rollback_transaction; return 1; } ;;
+        ip-acme) CERT_MODE="ip-acme"; issue_acme_certificate "$PUBLIC_IP" ip-acme || { rollback_transaction; return 1; } ;;
+        domain-acme) CERT_MODE="domain-acme"; issue_acme_certificate "$TLS_SNI" domain-acme || { rollback_transaction; return 1; } ;;
+        existing) CERT_MODE="existing"; configure_existing_certificate "$source_cert" "$source_key" "$TLS_SNI" || { rollback_transaction; return 1; } ;;
+        selfsigned) CERT_MODE="selfsigned"; ACME_CHALLENGE_PORT=""; generate_self_signed_certificate "$TLS_SNI" || { rollback_transaction; return 1; } ;;
+        *) rollback_transaction; return 1 ;;
+    esac
+
+    if ! save_installer_state; then rollback_transaction; return 1; fi
+    if ! activate_server_config; then rollback_transaction; return 1; fi
+    if ! generate_client_configs || ! install_management_command; then rollback_transaction; return 1; fi
+    if ! secure_files; then rollback_transaction; return 1; fi
+    commit_transaction
+    cleanup_legacy_artifacts
+    cleanup_previous_acme_certificate "$previous_cert_mode" "$previous_sni"
+    cleanup_failed_acme_attempt
+    save_installer_state || warn "配置已生效，但安装器状态文件未能更新。"
+    print_client_result
+}
+
+quick_install() {
+    prepare_runtime || return 1
+    ensure_install_scope_safe || return 1
+    FAILED_ACME_IDENTIFIER=""
+    SERVER_ADDRESS="$PUBLIC_IP"; SERVER_PORT="443"
+    AUTH_PASSWORD="$(random_secret 32)" || return 1
+    OBFS_PASSWORD="$(random_secret 32)" || return 1
+    [[ -n "$AUTH_PASSWORD" && -n "$OBFS_PASSWORD" ]] || { error "无法生成安全随机密码。"; return 1; }
+    TLS_SNI="$PUBLIC_IP"; TLS_INSECURE="0"; TLS_PIN_SHA256=""; ACME_CHALLENGE_PORT=""
+    info "使用小白默认配置：UDP 443、随机双密码、可信 IP 证书优先、自动续期。"
+    perform_install quick
+}
+
+prompt_value() {
+    local prompt="$1" default="$2" answer
+    read -r -p "$prompt [$default]: " answer
+    printf '%s' "${answer:-$default}"
+}
+
+prompt_port_settings() {
+    while true; do
+        SERVER_PORT="$(prompt_value "UDP 端口" "${SERVER_PORT:-443}")"
+        valid_port "$SERVER_PORT" && return 0
+        warn "端口必须是 1-65535。"
+    done
+}
+
+prompt_certificate_strategy() {
+    local choice domain cert key
+    CERT_STRATEGY=""; CERT_SOURCE_FILE=""; KEY_SOURCE_FILE=""
+    while true; do
+        printf '\n证书方式：\n  1) 可信公网 IP 证书（推荐，无需域名）\n  2) 域名 ACME 证书\n  3) 使用现有系统可信证书\n  4) 自签名 + 指纹校验\n'
+        read -r -p "请选择 [1]: " choice
+        choice="${choice:-1}"
+        case "$choice" in
+            1) TLS_SNI="$PUBLIC_IP"; CERT_STRATEGY="ip-acme"; return 0 ;;
+            2)
+                read -r -p "已解析到本机公网 IP 的域名: " domain
+                if valid_hostname "$domain"; then
+                    SERVER_ADDRESS="$domain"; TLS_SNI="$domain"; CERT_STRATEGY="domain-acme"; return 0
+                fi
+                warn "域名格式无效。"
+                ;;
+            3)
+                read -r -p "完整证书链路径: " cert
+                read -r -p "私钥路径: " key
+                read -r -p "证书中的域名或 IP [$SERVER_ADDRESS]: " domain
+                TLS_SNI="${domain:-$SERVER_ADDRESS}"
+                CERT_STRATEGY="existing"; CERT_SOURCE_FILE="$cert"; KEY_SOURCE_FILE="$key"; return 0
+                ;;
+            4) TLS_SNI="$SERVER_ADDRESS"; CERT_STRATEGY="selfsigned"; return 0 ;;
+            *) warn "请输入 1-4。" ;;
+        esac
+    done
+}
+
+custom_install() {
+    prepare_runtime || return 1
+    ensure_install_scope_safe || return 1
+    read_current_config >/dev/null 2>&1 || true
+    SERVER_ADDRESS="$(prompt_value "客户端连接地址" "${SERVER_ADDRESS:-$PUBLIC_IP}")"
+    if ! valid_ip "$SERVER_ADDRESS" && ! valid_hostname "$SERVER_ADDRESS"; then
+        error "连接地址既不是有效 IP，也不是有效域名。"; return 1
+    fi
+    prompt_port_settings || return 1
+    AUTH_PASSWORD="$(prompt_value "认证密码（Enter 自动生成）" "${AUTH_PASSWORD:-$(random_secret 32)}")"
+    OBFS_PASSWORD="$(prompt_value "混淆密码（Enter 自动生成）" "${OBFS_PASSWORD:-$(random_secret 32)}")"
+    valid_secret "$AUTH_PASSWORD" && valid_secret "$OBFS_PASSWORD" || { error "密码必须为 1-256 个字符，且不能包含控制字符。"; return 1; }
+    prompt_certificate_strategy || return 1
+    perform_install "$CERT_STRATEGY" "$CERT_SOURCE_FILE" "$KEY_SOURCE_FILE"
+}
+
+show_config() {
+    if ! read_current_config; then error "尚未安装或配置不完整。"; return 1; fi
+    [[ -f "$CLIENT_DIR/url.txt" ]] || generate_client_configs || return 1
+    printf '\nHysteria 2 配置\n'
+    printf '  状态：%s\n' "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || printf 'unknown')"
+    printf '  地址：%s\n' "$(client_server_value)"
+    printf '  证书：%s\n' "$CERT_MODE"
+    printf '  SNI：%s\n' "$TLS_SNI"
+    printf '  认证密码：%s\n' "$AUTH_PASSWORD"
+    printf '  混淆密码：%s\n' "$OBFS_PASSWORD"
+    printf '  分享链接：%s\n' "$(cat "$CLIENT_DIR/url.txt")"
+    printf '  SOCKS5：%s\n' "$CLIENT_DIR/hy-client.yaml"
+    printf '  原生 TUN：%s\n' "$CLIENT_DIR/hy-client-tun.yaml"
+    [[ "$TLS_INSECURE" == "1" ]] && warn "自签名模式必须保留 pinSHA256，不能只开启 insecure。"
+    return 0
+}
+
+diagnose() {
+    local failures=0 cert_end
+    require_root || return 1
+    printf 'Hysteria 2 诊断（脚本 %s）\n' "$SCRIPT_VERSION"
+    if [[ -x "$HYSTERIA_BIN" ]]; then
+        printf '[OK] 内核：%s\n' "$("$HYSTERIA_BIN" version 2>/dev/null | head -n1)"
+    else
+        printf '[FAIL] 未找到 Hysteria 内核：%s\n' "$HYSTERIA_BIN"; failures=$((failures + 1))
+    fi
+    if read_current_config; then
+        printf '[OK] 配置已读取，auth/obfs 分区解析正常\n'
+    else
+        printf '[FAIL] 配置缺失或密码读取失败\n'; failures=$((failures + 1))
+    fi
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        printf '[OK] 服务正在运行\n'
+    else
+        printf '[FAIL] 服务未运行\n'; failures=$((failures + 1))
+        journalctl -u "$SERVICE_NAME" -n 15 --no-pager 2>/dev/null || true
+    fi
+    if ss -H -lun 2>/dev/null | grep -Eq ":${SERVER_PORT}([[:space:]]|$)"; then
+        printf '[OK] 检测到 UDP 监听\n'
+    else
+        printf '[WARN] 未检测到 UDP %s 监听，请结合服务日志确认\n' "$SERVER_PORT"
+    fi
+    if [[ -f "$CURRENT_CERT_FILE" && -f "$CURRENT_KEY_FILE" ]] && validate_certificate_pair "$CURRENT_CERT_FILE" "$CURRENT_KEY_FILE" "$TLS_SNI"; then
+        cert_end="$(openssl x509 -in "$CURRENT_CERT_FILE" -noout -enddate 2>/dev/null | cut -d= -f2-)"
+        printf '[OK] 证书、私钥及 SAN 匹配；到期：%s\n' "$cert_end"
+    else
+        printf '[FAIL] 证书检查失败\n'; failures=$((failures + 1))
+    fi
+    if [[ "$TLS_INSECURE" == "1" ]]; then
+        if [[ -n "$TLS_PIN_SHA256" ]]; then printf '[OK] 自签名证书已绑定 SHA-256 指纹\n'; else printf '[FAIL] 自签名证书缺少指纹\n'; failures=$((failures + 1)); fi
+    else
+        if certificate_is_system_trusted "$CURRENT_CERT_FILE"; then
+            printf '[OK] 客户端使用系统信任链验证证书\n'
+        else
+            printf '[FAIL] 证书链未通过系统信任校验\n'; failures=$((failures + 1))
+        fi
+    fi
+    if [[ "$CERT_MODE" == "ip-acme" || "$CERT_MODE" == "domain-acme" ]]; then
+        if [[ -x "$ACME_HOME/acme.sh" ]] && "$ACME_HOME/acme.sh" --list 2>/dev/null | grep -Fq "$TLS_SNI"; then
+            printf '[OK] ACME 续期配置存在\n'
+        else
+            printf '[FAIL] 未找到当前证书的 ACME 续期配置\n'; failures=$((failures + 1))
+        fi
+        if has_cmd crontab && crontab -l 2>/dev/null | grep -Fq "$ACME_HOME/acme.sh"; then
+            printf '[OK] ACME 定时续期任务存在\n'
+        else
+            printf '[FAIL] 未找到 ACME 定时续期任务\n'; failures=$((failures + 1))
+        fi
+        if [[ -n "$ACME_CHALLENGE_PORT" ]] && tcp_port_in_use "$ACME_CHALLENGE_PORT"; then
+            printf '[WARN] TCP %s 当前被占用，下一次独立 ACME 验证可能无法绑定该端口\n' "$ACME_CHALLENGE_PORT"
+        fi
+    fi
+    if [[ -f "$CLIENT_DIR/hy-client-tun.yaml" ]] && grep -qF "$PUBLIC_IP/" "$CLIENT_DIR/hy-client-tun.yaml"; then
+        printf '[OK] TUN 配置已排除服务器公网 IP，避免代理回环\n'
+    else
+        printf '[WARN] TUN 配置未发现服务器 IP 排除项，请重新生成客户端配置\n'
+    fi
+    printf '[INFO] 脚本不修改本机防火墙；请自行放行 UDP %s%s\n' "$SERVER_PORT" "${ACME_CHALLENGE_PORT:+，TCP $ACME_CHALLENGE_PORT}"
+    if ((failures == 0)); then success "本机检查未发现阻断项。云安全组、运营商 UDP 和客户端行为需在实机验证。"; else error "发现 $failures 个本机问题。"; return 1; fi
+}
+
+service_menu() {
+    local choice
+    printf '\n1) 启动  2) 停止  3) 重启  4) 状态  5) 实时日志  0) 返回\n'
+    read -r -p "请选择: " choice
+    case "$choice" in
+        1) systemctl start "$SERVICE_NAME" && success "服务已启动。" ;;
+        2) systemctl stop "$SERVICE_NAME" && success "服务已停止。" ;;
+        3) systemctl restart "$SERVICE_NAME" && success "服务已重启。" ;;
+        4) systemctl status "$SERVICE_NAME" --no-pager ;;
+        5) journalctl -u "$SERVICE_NAME" -f ;;
+        0|"") return 0 ;;
+        *) warn "无效选项。" ;;
+    esac
+}
+
+update_core() {
+    require_root || return 1
+    detect_os || return 1
+    install_dependencies || return 1
+    read_current_config || { error "尚未安装。"; return 1; }
+    begin_transaction || return 1
+    if ! install_hysteria_core || ! ensure_service_unit || ! systemctl restart "$SERVICE_NAME"; then
+        rollback_transaction; return 1
+    fi
+    sleep 2
+    if ! systemctl is-active --quiet "$SERVICE_NAME"; then rollback_transaction; return 1; fi
+    commit_transaction
+    success "内核已更新，服务运行正常。"
+}
+
+remove_acme_assets() {
+    local identifier="$1" remaining
+    [[ -x "$ACME_HOME/acme.sh" ]] || return 0
+    if [[ "$CERT_MODE" == "ip-acme" || "$CERT_MODE" == "domain-acme" ]]; then
+        "$ACME_HOME/acme.sh" --remove -d "$identifier" --ecc >/dev/null 2>&1 || true
+    fi
+    [[ "$ACME_OWNED" == "1" ]] || return 0
+    remaining="$("$ACME_HOME/acme.sh" --list 2>/dev/null | awk 'NR > 1 && NF {count++} END {print count+0}')"
+    if [[ "$remaining" == "0" ]]; then
+        "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1 || true
+        [[ -d "$ACME_HOME" ]] && safe_remove_tree "$ACME_HOME" || true
+    else
+        warn "acme.sh 中仍有其他证书，已保留 ACME 客户端与续期任务。"
+    fi
+}
+
+remove_managed_data_files() {
+    rm -f "$CONFIG_FILE" "$STATE_FILE" "$CERT_FILE" "$KEY_FILE"
+    if [[ -d "$BACKUP_DIR" ]]; then
+        find "$BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.yaml' -delete || return 1
+        if ! rmdir "$BACKUP_DIR" 2>/dev/null; then warn "备份目录中存在非本脚本文件，已保留：$BACKUP_DIR"; fi
+    fi
+    if [[ -d "$CONFIG_DIR" ]] && ! rmdir "$CONFIG_DIR" 2>/dev/null; then
+        warn "配置目录中存在非本脚本文件，已保留：$CONFIG_DIR"
+    fi
+    rm -f "$CLIENT_DIR/url.txt" "$CLIENT_DIR/hy-client.yaml" "$CLIENT_DIR/hy-client-tun.yaml" "$CLIENT_DIR/hy-client.json"
+    if [[ -d "$CLIENT_DIR" ]] && ! rmdir "$CLIENT_DIR" 2>/dev/null; then
+        warn "客户端目录中存在非本脚本文件，已保留：$CLIENT_DIR"
+    fi
+}
+
+uninstall_hysteria() {
+    local confirmation
+    require_root || return 1
+    managed_paths_are_safe || { error "检测到托管路径为符号链接或指向预期目录之外，已拒绝卸载。"; return 1; }
+    has_valid_installer_state || { error "未找到本脚本的有效安装状态，拒绝删除可能由其他方式创建的 Hysteria。"; return 1; }
+    read_current_config >/dev/null 2>&1 || true
+    printf '将删除本脚本管理的服务、配置、客户端文件和内核；不会修改任何防火墙规则。\n'
+    read -r -p "请输入 UNINSTALL 确认: " confirmation
+    [[ "$confirmation" == "UNINSTALL" ]] || { warn "已取消。"; return 0; }
+
+    systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+    cleanup_legacy_artifacts
+    remove_acme_assets "$TLS_SNI"
+    rm -f "$SERVICE_FILE" "$MANAGEMENT_BIN"
+    if [[ "$HYSTERIA_CORE_OWNED" == "1" ]]; then
+        rm -f "$SERVICE_TEMPLATE_FILE" "$HYSTERIA_BIN"
+    else
+        warn "Hysteria 内核在首次安装前已存在，已保留内核与官方模板服务。"
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    remove_managed_data_files || return 1
+    if [[ "$HYSTERIA_USER_OWNED" == "1" ]]; then
+        if id hysteria >/dev/null 2>&1 && ! userdel hysteria >/dev/null 2>&1; then
+            warn "hysteria 用户仍被占用，未删除其主目录。"
+        elif [[ -d "$HYSTERIA_HOME_DIR" ]]; then
+            safe_remove_tree "$HYSTERIA_HOME_DIR" || true
+        fi
+    fi
+    success "卸载完成。未修改任何防火墙规则，也不会删除其他 ACME 证书。"
+}
+
+print_header() {
+    printf '%bHysteria 2 小白一键脚本%b  v%s\n' "$C_BLUE" "$C_RESET" "$SCRIPT_VERSION"
+}
+
+main_menu() {
+    local choice default_choice
+    require_root || return 1
+    while true; do
+        print_header
+        if [[ -f "$CONFIG_FILE" ]]; then default_choice=3; else default_choice=1; fi
+        cat <<'EOF'
+  1) 一键安装 / 重装（全自动推荐配置）
+  2) 自定义安装 / 修改
+  3) 查看配置与分享链接
+  4) 重新生成客户端配置
+  5) 服务管理
+  6) 一键诊断
+  7) 更新 Hysteria 内核
+  8) 安全卸载
+  0) 退出
+EOF
+        read -r -p "请选择 [${default_choice}]: " choice
+        choice="${choice:-$default_choice}"
+        case "$choice" in
+            1) quick_install || true ;;
+            2) custom_install || true ;;
+            3) show_config || true ;;
+            4)
+                if read_current_config && generate_client_configs; then success "客户端配置已重新生成。"; else error "无法读取现有配置。"; fi
+                ;;
+            5) service_menu || true ;;
+            6) diagnose || true ;;
+            7) update_core || true ;;
+            8) uninstall_hysteria || true ;;
+            0) return 0 ;;
+            *) warn "无效选项，请输入 0-8。" ;;
+        esac
+        printf '\n'
+    done
+}
+
+print_help() {
+    cat <<EOF
+用法：bash hysteria.sh [选项]
+  --install       全自动安装（默认 UDP 443）
+  --reinstall     使用全新随机密码重装
+  --diagnose      本机诊断
+  --uninstall     安全卸载（仍需输入 UNINSTALL）
+  --version       显示版本
+  --help          显示帮助
+EOF
+}
+
+main() {
+    case "${1:-}" in
+        --install|--reinstall) quick_install ;;
+        --diagnose) diagnose ;;
+        --uninstall) uninstall_hysteria ;;
+        --version) printf '%s\n' "$SCRIPT_VERSION" ;;
+        --help|-h) print_help ;;
+        "") main_menu ;;
+        *) error "未知选项：$1"; print_help; return 2 ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

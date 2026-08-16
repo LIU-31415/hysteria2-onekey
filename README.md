@@ -1,184 +1,173 @@
-# Hysteria 2 一键安装脚本
+# Hysteria 2 小白一键安装脚本
 
-一条命令，在你的 Linux VPS 上装好 Hysteria 2 服务端：自动下载内核、生成配置、自签证书、放行防火墙、注册系统服务，装完直接输出客户端分享链接。**不需要域名，不需要 Linux 经验，安装时一路回车即可——交互提示全是中文，不用看懂英文。**
+面向个人 Linux VPS：下载后按一次 Enter，即可完成 Hysteria 2 安装、可信证书、随机密码和客户端配置。
 
-## 这是什么？
+## 一键安装
 
-Hysteria 2 是基于 QUIC 的代理协议，抗丢包、低延迟，弱网环境下比传统协议稳定得多。这个脚本把整套服务端部署变成菜单问答：选端口、选密码、选证书方式，其余全自动。装完后输入 `hy2` 即可随时调出管理菜单。
-
-## 适合谁？
-
-- **刚买了第一台 VPS 的新手** —— 全程菜单引导，每个选择都有推荐默认值，一路回车就能装好，不用手写配置文件
-- **没有域名的人** —— 默认自签证书，TLS 加密完整，无需域名
-- **想省事的老手** —— 改端口、换密码、看分享链接，一条命令进菜单，不用翻文件
-
-## 和同类脚本比，差别在哪？
-
-| 对比点 | 本脚本 | 常见同类脚本 |
-|--------|--------|--------------|
-| 证书 | 默认自签（无需域名），支持 ACME / 已有证书 | 常需域名或手动指定证书 |
-| 端口 | 默认 443 伪装 HTTPS，可随时切换端口跳跃 | 单一模式居多 |
-| 卸载 | 二次确认保护，防误删 | 部分脚本无保护 |
-| 网络 | WARP 泄漏修复（`trap` 保证退出时恢复） | 少见 |
-| 安装 | 先检测已有服务，避免重复安装 | 部分脚本直接覆盖 |
-
-## 安全说明：跑之前，先知道它会做什么
-
-在服务器上跑一条 `curl | bash`，先搞清楚脚本做了什么——这个警惕是对的。本脚本承诺透明：
-
-- **安装时做这些事**：检测系统 → 安装依赖 → 下载官方内核（[apernet](https://github.com/apernet/hysteria) 发布）→ 生成配置 → 自签证书 → 配置防火墙 → 注册 systemd 服务
-- **数据落点**：配置在 `/etc/hysteria/`，客户端链接在 `/root/hy/url.txt`
-- **卸载干净吗**：菜单「输入 2」，带二次确认，移除服务、iptables 规则与文件
-- **代码全公开**：安装前可以先下载审查（下方「方式二」），本脚本经过多轮人工审查
-- **默认最稳**：自签证书 + 证书指纹固定（防中间人），不推荐旧式跳过证书验证的配置
-
-## 快速开始
-
-### 方式一：一键安装（推荐）
-
-SSH 登录 VPS 后，直接运行以下命令即可：
+使用 `root` 登录 VPS，粘贴下面一行并按 Enter：
 
 ```bash
-# 使用 curl
-bash <(curl -sL https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh)
-
-# 或使用 wget
-bash <(wget -qO- https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh)
+curl -fL https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh -o hysteria.sh && sudo bash hysteria.sh --install
 ```
 
-运行后自动进入管理菜单，输入 `1` 开始安装，之后一路回车即可——每一步都已预设推荐默认值（自签证书、443 单端口、随机密码、403 伪装、不限带宽、Salamander 混淆）。
-
-> 💡 **已安装过？** 想覆盖重装可以跳过菜单，一步到位：
-> ```bash
-> bash <(curl -sL https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh) --reinstall
-> ```
-
-### 方式二：手动下载安装
-
-想先审查脚本内容，或需要离线安装时使用：
+整行粘贴后只需按一次 Enter，后续不再询问配置。若需要自定义端口、密码或证书，再执行下面的菜单命令：
 
 ```bash
-# 下载脚本
-wget https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh
-
-# 或从 Releases 下载最新版
-# wget https://github.com/LIU-31415/hysteria2-onekey/releases/latest/download/hysteria.sh
-
-# 赋予执行权限并运行
-chmod +x hysteria.sh
-bash hysteria.sh
+sudo bash hysteria.sh
 ```
 
-### 管理菜单
+默认配置：
 
-```
-输入 1 → 安装（按提示选择配置）
-输入 2 → 卸载（带确认保护）
-输入 3 → 启动/停止/重启服务
-输入 4 → 修改配置
-输入 5 → 查看客户端配置和分享链接
-输入 6 → 更新脚本（从 GitHub 拉取最新版）
-输入 7 → 更新 Hysteria 2 内核（服务端二进制，更新后自动重启服务）
-输入 8 → 显示证书指纹（自签证书客户端固定用，配合 v2rayN『证书指纹』字段）
-```
+- UDP `443`，Hysteria 官方推荐的默认端口；
+- 自动生成独立的认证密码和 Salamander 混淆密码；
+- 优先申请 Let's Encrypt 短期公网 IP 证书，无需域名；
+- 证书申请失败时自动回退到“自签名证书 + SHA-256 指纹固定”；
+- 使用内核默认的 BBR 拥塞控制，不填写容易适得其反的虚假带宽；
+- 开启协议嗅探，改善 TUN 场景中的域名处理；
+- 自动生成 SOCKS5、原生 TUN 和标准 `hysteria2://` 分享链接。
 
-安装完成后直接输入 `hy2` 即可再次调出管理菜单。
+## 安装前只需确认
 
-#### 修改配置（选项 4）子菜单
+- VPS 使用带 `systemd` 和 OpenSSL 1.1.1+、仍在官方支持期内的系统；推荐 Debian 12+、Ubuntu 22.04 LTS+、Rocky/Alma/RHEL 8+、CentOS Stream 9+ 或当前受支持的 Fedora，不要使用已停止维护的 CentOS 7；
+- VPS 有可从公网直接访问的 IPv4 或 IPv6；
+- 云平台安全组放行 `UDP 443`；
+- 为自动申请/续期证书，再放行 `TCP 443`。如果 TCP 443 已被其他程序占用，脚本会改用 `TCP 80` 并在结果中提示。
 
-```
-1. 修改端口     ← 可随时切换单端口/端口跳跃模式
-2. 修改密码
-3. 修改证书类型
-4. 修改伪装形式
-5. 编辑带宽限速
-6. 修改流量混淆 (Salamander) ← 开关混淆/换混淆密码
-```
+脚本不会读取、添加或删除任何本机防火墙规则，也无法替你修改云厂商安全组。请自行放行所需端口；大多数“服务正常但客户端超时”都与云安全组、本机防火墙或上游 UDP 限制有关。
 
-> 修改端口会停止服务 → 重新走端口配置流程（选模式 + 填端口）→ 自动重启生效，无需手动操作。
+## 客户端文件
 
-## 配置说明
+安装完成后生成：
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| 证书 | 自签证书（域名随机池） | 无域名也能用，TLS 加密完整，域名从通用池随机选取 |
-| 混淆 | Salamander（默认开启） | 将 QUIC 流量伪装为随机 UDP，规避深度检测 |
-| 端口 | 443 | 伪装成标准 HTTPS/QUIC 流量 |
-| 伪装 | String 403 Forbidden | 模拟 Nginx 拒绝访问，性能最优 |
-| 带宽 | 不限制（客户端自控） | 服务端不限速，客户端设置多少跑多少 |
-| 拥塞控制 | BBR（standard） | Hysteria 2 默认值，无需额外配置 |
-
-### 证书
-
-- **自签证书（默认）**：无需域名，TLS 加密不受影响。客户端两种配置方式：
-  - **证书指纹固定（推荐）**：脚本菜单 `8. 显示证书指纹`，将指纹填入客户端『证书指纹』字段（`insecure: false`），防中间人且兼容新版内核（Xray v26.2.6+ 已移除跳过证书验证）
-  - 旧式 `insecure: true`：已不推荐，新版 Xray 核心已禁用该参数
-- **ACME 自动申请**：需域名，脚本自动申请 Let's Encrypt 证书
-- **已有证书文件**：手动指定 crt/key 路径
-
-### 端口
-
-- **单端口模式（推荐）**：默认 443，流量伪装为普通 HTTPS
-- **端口跳跃模式**：多端口间切换，对抗运营商 QoS 限速
-  - 默认范围：30000-31000（起始端口随机生成于 30000-50000，范围 ~1000 端口）
-  - 默认间隔：30s（可选随机 10-60s）
-
-### 带宽
-
-**服务端不设限速，由客户端自己控制。** 这是社区最推荐的个人使用方式。
-
-客户端配置示例（根据实际网速调整）：
-
-```yaml
-bandwidth:
-  up: 30 mbps      # 实际上行的 70-80%
-  down: 100 mbps   # 实际下行的 70-80%
+```text
+/root/hy/url.txt             标准分享链接
+/root/hy/hy-client.yaml      官方客户端 SOCKS5 配置
+/root/hy/hy-client-tun.yaml  官方客户端原生 TUN 配置
 ```
 
-> ⚠️ 带宽值**绝对不能高于 VPS 实际能跑的上限**，否则 Brutal 算法会拼命发包补偿丢包，反而又慢又卡。
+原生 TUN 配置会自动把服务器公网 IP 加入 `ipv4Exclude` 或 `ipv6Exclude`，避免连接服务器本身的流量再次进入 TUN，形成代理回环。
 
-## v2rayN 客户端导入
+对于 v2rayN、NekoBox、Clash Meta 等第三方客户端，优先导入 `url.txt` 中的链接。可信 IP/域名证书模式使用正常系统信任链，兼容性最好。
 
-安装完成后脚本会输出 `hysteria2://` 开头的分享链接，复制后在 v2rayN 中：
+如果安装结果显示使用了自签名证书：
 
+- 不要删除分享链接或 YAML 中的 `pinSHA256`；
+- 某些 v2rayN 版本导入链接时可能丢失证书指纹，建议使用生成的 YAML，或在客户端中确认已保留该字段；
+- `insecure: true` 只是兼容自签名握手，真正限制服务器身份的是证书指纹。
+
+## 管理命令
+
+安装后可随时运行：
+
+```bash
+hy2
 ```
-服务器 → 从剪贴板导入 URL
+
+菜单功能：
+
+1. 一键安装/重装；
+2. 自定义安装/修改端口、密码和证书；
+3. 查看配置和分享链接；
+4. 重新生成客户端配置；
+5. 启停、重启、查看日志；
+6. 一键诊断；
+7. 更新 Hysteria 内核；
+8. 安全卸载。
+
+脚本不提供从远程 `master` 分支直接覆盖本机管理脚本的自更新入口，避免未经独立签名验证的远程代码以 `root` 权限安装。需要升级脚本时，请从可信来源重新下载并人工核对变更。
+
+非交互命令：
+
+```bash
+hy2 --diagnose
+hy2 --reinstall
+hy2 --uninstall
+hy2 --version
 ```
 
-或者查看 `/root/hy/url.txt` 文件获取链接。
+## TUN 连不上时
 
-## 常见问题
+先在 VPS 执行：
 
-### Q：自签证书安全吗？
+```bash
+hy2 --diagnose
+```
 
-TLS 加密完整，和正规 HTTPS 站点的加密强度一样。区别仅在于缺少 CA 签名验证——对科学上网场景来说足够安全。
+然后按顺序检查：
 
-### Q：不设带宽限速会不会把 VPS 跑满？
+1. 云安全组是否放行安装结果显示的 UDP 端口；
+2. 普通代理模式能否连接；
+3. 客户端是否以管理员权限启动 TUN；
+4. 客户端导入后，`SNI`、`obfs-password`、`insecure` 和 `pinSHA256` 是否被保留；
+5. 原生 TUN 配置是否包含服务器 IP 的 `ipv4Exclude`/`ipv6Exclude`；
+6. 当前网络是否直接封锁或严重限速 UDP/QUIC。
 
-不会。**客户端设多少跑多少**，如果你在客户端设 `down: 100 mbps`，最高就跑到 100。VPS 是自用的，你自己控制客户端即可。
+服务日志：
 
-### Q：连接不上怎么办？
+```bash
+journalctl -u hysteria-server.service -n 100 --no-pager
+```
 
-1. 检查 VPS 防火墙是否放行了 UDP 端口
-2. 查看日志：`journalctl -u hysteria-server -e`
-3. 客户端使用证书指纹固定（脚本菜单 8 查看指纹，填入客户端『证书指纹』字段，`insecure: false`）
+## 自定义安装
 
-### Q：看了脚本的审核报告，有改动过吗？
+菜单 `2` 支持：
 
-基于以下开源项目改进：
+- 单 UDP 端口；
+- 公网 IP ACME、域名 ACME、现有系统可信证书和自签名证书；
+- 自定义认证密码与混淆密码。
 
-- **[Misaka-blog/hysteria-install](https://github.com/Misaka-blog/hysteria-install)** — 原始脚本，核心逻辑框架
-- **[Aki1106-0116/hy2-install](https://github.com/Aki1106-0116/hy2-install)** — 修复了证书申请和 URL 生成等问题的改进版
+为保持简单、安全且完全不操作防火墙，脚本只支持单 UDP 端口，默认使用 `443`。
 
-本脚本在此基础做的优化：
+## 安全与残留范围
 
-- 证书默认改为自签证书（无需域名）
-- 端口默认 443（单端口模式优先）
-- 带宽默认不限制（客户端自控）
-- 安装前检测是否已存在服务
-- 卸载增加确认保护，防误操作
-- WARP 泄漏修复（`trap` 保证退出时恢复网络）
+- 修改配置前创建事务快照；服务启动失败或按 `Ctrl+C` 时自动回滚；
+- 重装或修改配置不会隐式升级已可用的内核，内核更新必须由菜单 `7` 明确触发；
+- 首次运行前已存在的外部 Hysteria 内核不会在卸载时被误删；没有本脚本状态文件时拒绝执行卸载；
+- 检测到未被本脚本记录的现有配置、服务或客户端目录时拒绝覆盖；卸载时保留目录里的未知文件；
+- 配置先写临时文件，再原子替换；仅保留最近 3 份配置备份；
+- 私钥不会被改成全局可读，现有证书会复制到专用目录；
+- 安装、修改、回滚和卸载均不会调用 UFW、firewalld、iptables 或 nftables；
+- 不使用模糊的 `/etc/crontab` 文本删除；ACME 续期由 acme.sh 自己管理；
+- 卸载必须输入 `UNINSTALL`，不会删除其他 ACME 证书，也不会修改云平台安全组。
 
----
+## Windows 开发检查
 
-> 核心逻辑基于 [Misaka-blog](https://github.com/Misaka-blog) 与 [Aki1106-0116](https://github.com/Aki1106-0116) 的开源脚本改进，Hysteria 2 核心由 [apernet](https://github.com/apernet/hysteria) 开发
+项目是 Linux Bash 脚本。Windows 本机没有 Bash/ShellCheck 时，推荐使用 WSL：
+
+先在 Windows PowerShell 运行仓库自带的基础检查：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\static-check.ps1
+```
+
+完整语法、ShellCheck 和单元测试使用 WSL：
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+重启并进入 Ubuntu 后：
+
+```bash
+sudo apt update
+sudo apt install -y shellcheck
+cd /mnt/c/你的项目路径
+bash -n hysteria.sh tests/test.sh
+shellcheck --severity=warning hysteria.sh tests/test.sh
+bash tests/test.sh
+```
+
+仓库中的 GitHub Actions 也会在 Ubuntu 上自动执行上述语法检查、ShellCheck 和单元测试。Windows 编辑器请保留 `.sh` 的 LF 换行；仓库已通过 `.gitattributes` 强制此规则。
+
+## 设计依据
+
+- [Hysteria 2 完整服务端配置](https://v2.hysteria.network/docs/advanced/Full-Server-Config/)
+- [Hysteria 2 完整客户端配置](https://v2.hysteria.network/docs/advanced/Full-Client-Config/)
+- [Hysteria 2 URI 规范](https://v2.hysteria.network/docs/developers/URI-Scheme/)
+- [Let's Encrypt：IP 地址证书正式可用](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability.html)
+
+## 当前验证状态
+
+已提供 Bash 语法、ShellCheck 和纯函数/配置生成测试。真实 VPS 上的证书签发、systemd、客户端导入及 TUN 连通性必须在实际 Linux 服务器与客户端网络中验证。
+
+完整实机步骤见 [TESTING.md](TESTING.md)。
