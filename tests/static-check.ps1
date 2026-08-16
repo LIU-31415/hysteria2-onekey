@@ -35,6 +35,8 @@ $required = @(
     'ensure_install_scope_safe',
     'managed_paths_are_safe',
     'remove_managed_data_files',
+    'REPO_RAW_URL',
+    'check_script_update',
     '脚本不会修改防火墙',
     '有效安装状态，拒绝删除可能由其他方式创建的 Hysteria',
     '请输入 UNINSTALL 确认'

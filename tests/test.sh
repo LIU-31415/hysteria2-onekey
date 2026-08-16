@@ -225,4 +225,21 @@ assert_contains "$MOCK_LOG" "systemctl enable $SERVICE_NAME"
 assert_contains "$MOCK_LOG" "systemctl start $SERVICE_NAME"
 [[ "$TRANSACTION_ACTIVE" == "0" ]] || fail "transaction remained active after rollback"
 
+# --- script update check (mock curl + auto-confirm) ---
+curl() {
+    local out=""
+    while (($# > 0)); do
+        [[ "$1" == "-o" ]] && { out="$2"; shift 2; continue; }
+        shift
+    done
+    cat >"$out" <<'EOF'
+#!/usr/bin/env bash
+readonly SCRIPT_VERSION="9.9.9"
+EOF
+}
+read() { printf 'y\n'; confirm='y'; }
+check_script_update || fail "script update check failed"
+assert_contains "$MANAGEMENT_BIN" '9.9.9'
+[[ -x "$MANAGEMENT_BIN" ]] || fail "updated management binary is not executable"
+
 printf 'All tests passed.\n'

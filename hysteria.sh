@@ -4,8 +4,9 @@
 set -o pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.0.1"
+readonly SCRIPT_VERSION="2.0.3"
 readonly CORE_INSTALLER_URL="https://get.hy2.sh/"
+readonly REPO_RAW_URL="https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh"
 
 if [[ "${HY2_TEST_MODE:-0}" == "1" ]]; then
     CONFIG_DIR="${HY2_CONFIG_DIR:-/etc/hysteria}"
@@ -1207,10 +1208,15 @@ diagnose() {
         else
             printf '[FAIL] 未找到当前证书的 ACME 续期配置\n'; failures=$((failures + 1))
         fi
-        if has_cmd crontab && crontab -l 2>/dev/null | grep -Fq "$ACME_HOME/acme.sh"; then
+        if has_cmd crontab && crontab -l 2>/dev/null | grep -Fq 'acme.sh --cron'; then
             printf '[OK] ACME 定时续期任务存在\n'
         else
             printf '[FAIL] 未找到 ACME 定时续期任务\n'; failures=$((failures + 1))
+        fi
+        if systemctl is-active --quiet cron.service 2>/dev/null || systemctl is-active --quiet crond.service 2>/dev/null; then
+            printf '[OK] cron 服务运行中\n'
+        else
+            printf '[FAIL] cron 服务未运行，续期任务不会执行\n'; failures=$((failures + 1))
         fi
         if [[ -n "$ACME_CHALLENGE_PORT" ]] && tcp_port_in_use "$ACME_CHALLENGE_PORT"; then
             printf '[WARN] TCP %s 当前被占用，下一次独立 ACME 验证可能无法绑定该端口\n' "$ACME_CHALLENGE_PORT"
@@ -1238,6 +1244,33 @@ service_menu() {
         0|"") return 0 ;;
         *) warn "无效选项。" ;;
     esac
+}
+
+check_script_update() {
+    local tmp_file="/tmp/hy2-latest.sh" current="$SCRIPT_VERSION" new="" confirm=""
+    info "正在从 GitHub 下载最新脚本…"
+    if ! curl -fL --retry 3 --connect-timeout 10 --max-time 60 "$REPO_RAW_URL" -o "$tmp_file"; then
+        error "下载最新脚本失败，请检查网络。"
+        return 1
+    fi
+    [[ "$(head -n 1 "$tmp_file")" == '#!/usr/bin/env bash' ]] || { error "下载内容不是有效脚本（shebang 校验失败）。"; rm -f "$tmp_file"; return 1; }
+    bash -n "$tmp_file" || { error "下载脚本语法检查失败。"; rm -f "$tmp_file"; return 1; }
+    new="$(sed -n 's/^readonly SCRIPT_VERSION="\([^"]*\)"/\1/p' "$tmp_file" | head -n 1)"
+    [[ -n "$new" ]] || { error "无法识别下载脚本的版本号。"; rm -f "$tmp_file"; return 1; }
+    if [[ "$new" == "$current" ]]; then
+        info "当前已是最新版本：$current"
+        rm -f "$tmp_file"
+        return 0
+    fi
+    info "发现新版本：$current → $new"
+    read -r -p "是否立即安装新版本？（下载文件未经签名验证，请确认来源可信后选择）(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        install -m 755 "$tmp_file" "$MANAGEMENT_BIN" || { error "安装失败。"; rm -f "$tmp_file"; return 1; }
+        rm -f "$tmp_file"
+        success "已更新 $MANAGEMENT_BIN，下次运行 hy2 即生效（v$new）。"
+        return 0
+    fi
+    warn "已保留下载文件：$tmp_file；可手动执行：install -m 755 $tmp_file $MANAGEMENT_BIN"
 }
 
 update_core() {
@@ -1336,6 +1369,7 @@ main_menu() {
   6) 一键诊断
   7) 更新 Hysteria 内核
   8) 安全卸载
+  9) 检查脚本更新（确认后安装）
   0) 退出
 EOF
         read -r -p "请选择 [${default_choice}]: " choice
@@ -1351,6 +1385,7 @@ EOF
             6) diagnose || true ;;
             7) update_core || true ;;
             8) uninstall_hysteria || true ;;
+            9) check_script_update || true ;;
             0) return 0 ;;
             *) warn "无效选项，请输入 0-8。" ;;
         esac
@@ -1365,6 +1400,7 @@ print_help() {
   --reinstall     使用全新随机密码重装
   --diagnose      本机诊断
   --uninstall     安全卸载（仍需输入 UNINSTALL）
+  --check-update  检查脚本更新（确认后安装）
   --version       显示版本
   --help          显示帮助
 EOF
@@ -1375,6 +1411,7 @@ main() {
         --install|--reinstall) quick_install ;;
         --diagnose) diagnose ;;
         --uninstall) uninstall_hysteria ;;
+        --check-update) check_script_update ;;
         --version) printf '%s\n' "$SCRIPT_VERSION" ;;
         --help|-h) print_help ;;
         "") main_menu ;;

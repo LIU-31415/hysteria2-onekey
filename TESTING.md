@@ -33,6 +33,8 @@ sudo hy2 --diagnose
 - `/root/hy/url.txt`、`hy-client.yaml`、`hy-client-tun.yaml` 均存在且权限为 `600`；
 - `/etc/hysteria/server.key` 权限不是全局可读；
 - 可信证书模式下存在 acme.sh 续期条目；自签名回退模式下链接和 YAML 均包含 `pinSHA256`。
+- 诊断能识别带引号路径的 acme.sh cron 条目（v2.0.2+），且 cron 服务处于运行状态。
+- 菜单 `9` / `hy2 --check-update` 能下载并显示当前版本号，确认后才安装。
 - 脚本不会修改本机防火墙；云安全组和已有本机防火墙必须由你自行放行端口。
 
 ```bash
