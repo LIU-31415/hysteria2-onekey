@@ -1,6 +1,6 @@
 # Hysteria 2 小白一键安装脚本
 
-面向个人 Linux VPS：下载后按一次 Enter，即可完成 Hysteria 2 安装、可信证书、随机密码和客户端配置。
+面向个人 Linux VPS：下载后按一次 Enter，即可完成 Hysteria 2 安装、优先申请可信证书、生成随机密码和客户端配置。
 
 ## 一键安装
 
@@ -18,12 +18,11 @@ sudo bash hysteria.sh
 
 默认配置：
 
-- UDP `443`，Hysteria 官方推荐的默认端口；
+- UDP `443`，Hysteria 的默认 HTTP/3 端口；
 - 自动生成独立的认证密码和 Salamander 混淆密码；
 - 优先申请 Let's Encrypt 短期公网 IP 证书，无需域名；
 - 证书申请失败时自动回退到“自签名证书 + SHA-256 指纹固定”；
-- 使用内核默认的 BBR 拥塞控制，不填写容易适得其反的虚假带宽；
-- 开启协议嗅探，改善 TUN 场景中的域名处理；
+- 使用 Hysteria 默认的 BBR 拥塞控制，不填写容易适得其反的虚假带宽；这里不是修改 Linux 内核 BBR；
 - 自动生成 SOCKS5、原生 TUN 和标准 `hysteria2://` 分享链接。
 
 ## 安装前只需确认
@@ -47,6 +46,8 @@ sudo bash hysteria.sh
 
 原生 TUN 配置会自动把服务器公网 IP 加入 `ipv4Exclude` 或 `ipv6Exclude`，避免连接服务器本身的流量再次进入 TUN，形成代理回环。
 
+该 TUN 文件可直接用于 Windows 和 Linux。macOS 要求接口名采用 `utun数字`，请把其中的 `tun.name` 改成例如 `utun123`。
+
 对于 v2rayN、NekoBox、Clash Meta 等第三方客户端，优先导入 `url.txt` 中的链接。可信 IP/域名证书模式使用正常系统信任链，兼容性最好。
 
 如果安装结果显示使用了自签名证书：
@@ -65,17 +66,16 @@ hy2
 
 菜单功能：
 
-1. 一键安装/重装；
+1. 一键安装；已有安装只更新管理脚本，不修改服务配置；
 2. 自定义安装/修改端口、密码和证书；
 3. 查看配置和分享链接；
 4. 重新生成客户端配置；
 5. 启停、重启、查看日志；
 6. 一键诊断；
 7. 更新 Hysteria 内核；
-8. 安全卸载；
-9. 检查脚本更新（下载并校验后，需人工确认才会安装）。
+8. 安全卸载。
 
-脚本不自作主张执行远程代码：菜单 `9` / `hy2 --check-update` 只把最新脚本下载到 `/tmp/hy2-latest.sh`，校验 shebang 与语法、对比版本号，**必须由你确认后才会覆盖安装**。
+脚本不提供联网自更新功能。更新管理脚本时，请从仓库重新下载、人工核对后执行 `sudo bash hysteria.sh --install`；已有服务配置和密码保持不变，只刷新 `/usr/bin/hy2`。安装或更新 Hysteria 内核、安装 acme.sh 时，脚本会下载并执行对应项目的官方安装器；这是明确的外部信任边界。
 
 非交互命令：
 
@@ -83,9 +83,10 @@ hy2
 hy2 --diagnose
 hy2 --reinstall
 hy2 --uninstall
-hy2 --check-update
 hy2 --version
 ```
+
+重复执行 `--install` 只刷新管理脚本并保留现有配置；只有明确执行 `--reinstall` 才会轮换认证密码、混淆密码和客户端配置。
 
 ## 从旧版升级
 
@@ -125,22 +126,22 @@ journalctl -u hysteria-server.service -n 100 --no-pager
 菜单 `2` 支持：
 
 - 单 UDP 端口；
-- 公网 IP ACME、域名 ACME、现有系统可信证书和自签名证书；
+- 公网 IP ACME、域名 ACME、一次性导入现有系统可信证书和自签名证书；
 - 自定义认证密码与混淆密码。
 
 为保持简单、安全且完全不操作防火墙，脚本只支持单 UDP 端口，默认使用 `443`。
 
 ## 安全与残留范围
 
-- 修改配置前创建事务快照；服务启动失败或按 `Ctrl+C` 时自动回滚；
-- 重装或修改配置不会隐式升级已可用的内核，内核更新必须由菜单 `7` 明确触发；
+- 修改配置前创建事务快照；服务启动失败或按 `Ctrl+C` 时自动回滚；回滚不完整时保留快照并显示人工恢复路径；
+- 重装或修改配置不会隐式升级达到安全下限的内核；低于 `2.9.2` 时拒绝继续，内核更新由菜单 `7` 明确触发；
 - 首次运行前已存在的外部 Hysteria 内核不会在卸载时被误删；没有本脚本状态文件时拒绝执行卸载；
 - 检测到未被本脚本记录的现有配置、服务或客户端目录时拒绝覆盖；卸载时保留目录里的未知文件；
 - 配置先写临时文件，再原子替换；仅保留最近 3 份配置备份；
-- 私钥不会被改成全局可读，现有证书会复制到专用目录；
+- 私钥不会被改成全局可读；现有证书会复制到专用目录，但不会跟随源文件自动续期，更新后需要重新导入；
 - 安装、修改、回滚和卸载均不会调用 UFW、firewalld、iptables 或 nftables；
-- 不使用模糊的 `/etc/crontab` 文本删除；ACME 续期由 acme.sh 自己管理；
-- 卸载必须输入 `UNINSTALL`，不会删除其他 ACME 证书，也不会修改云平台安全组。
+- 不使用模糊的 `/etc/crontab` 文本删除；ACME 续期由 acme.sh 自己管理，诊断会检查证书订单、定时任务和 cron 服务；
+- 单独记录 ACME 证书订单所有权；旧状态或外部订单默认保留；卸载必须输入 `UNINSTALL`，也不会修改云平台安全组。
 
 ## Windows 开发检查
 
@@ -149,7 +150,7 @@ journalctl -u hysteria-server.service -n 100 --no-pager
 先在 Windows PowerShell 运行仓库自带的基础检查：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\static-check.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\static-check.ps1
 ```
 
 完整语法、ShellCheck 和单元测试使用 WSL：
@@ -176,6 +177,8 @@ bash tests/test.sh
 - [Hysteria 2 完整服务端配置](https://v2.hysteria.network/docs/advanced/Full-Server-Config/)
 - [Hysteria 2 完整客户端配置](https://v2.hysteria.network/docs/advanced/Full-Client-Config/)
 - [Hysteria 2 URI 规范](https://v2.hysteria.network/docs/developers/URI-Scheme/)
+- [Hysteria 2 正式版本与安全更新](https://github.com/HyNetworks/hysteria/releases)
+- [acme.sh 官方项目与续期说明](https://github.com/acmesh-official/acme.sh)
 - [Let's Encrypt：IP 地址证书正式可用](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability.html)
 
 ## 当前验证状态

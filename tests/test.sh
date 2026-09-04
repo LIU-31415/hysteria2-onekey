@@ -12,14 +12,14 @@ case "$(uname -s)" in
         export MSYS2_ARG_CONV_EXCL='*'
         openssl() {
             local a
-            local -a out=()
+            local -a openssl_args=()
             for a in "$@"; do
                 case "$a" in
                     /tmp/*) a="$(cygpath -w "$a")" ;;
                 esac
-                out+=("$a")
+                openssl_args+=("$a")
             done
-            command openssl "${out[@]}"
+            command openssl "${openssl_args[@]}"
         }
         ;;
 esac
@@ -60,6 +60,9 @@ valid_port 443 || fail "valid port rejected"
 ! valid_port 65536 || fail "invalid port accepted"
 valid_secret '中文-pass_123' || fail "valid secret rejected"
 ! valid_secret $'bad\tsecret' || fail "secret containing a control character was accepted"
+version_at_least 2.9.2 2.9.2 || fail "equal safe version was rejected"
+version_at_least 2.12.2 2.9.2 || fail "newer version was rejected"
+! version_at_least 2.9.1 2.9.2 || fail "unsafe old version was accepted"
 check_crypto_capabilities || fail "required OpenSSL capabilities are unavailable"
 
 secret_a="$(random_secret 32)"
@@ -94,6 +97,8 @@ assert_contains "$CONFIG_FILE" 'password: "obfs-only-value"'
 assert_not_contains "$CONFIG_FILE" 'fastOpen'
 assert_not_contains "$CONFIG_FILE" 'bandwidth:'
 assert_not_contains "$CONFIG_FILE" 'quic:'
+assert_not_contains "$CONFIG_FILE" 'sniff:'
+assert_not_contains "$CONFIG_FILE" 'masquerade:'
 
 AUTH_PASSWORD=""
 OBFS_PASSWORD=""
@@ -108,6 +113,7 @@ assert_contains "$CLIENT_DIR/hy-client.yaml" 'insecure: false'
 assert_contains "$CLIENT_DIR/hy-client-tun.yaml" 'ipv4Exclude:'
 assert_contains "$CLIENT_DIR/hy-client-tun.yaml" '203.0.113.10/32'
 assert_contains "$CLIENT_DIR/hy-client-tun.yaml" 'timeout: 5m'
+assert_contains "$CLIENT_DIR/hy-client-tun.yaml" 'macOS: change tun.name'
 assert_not_contains "$CLIENT_DIR/url.txt" 'mport='
 assert_not_contains "$CLIENT_DIR/url.txt" 'insecure='
 assert_contains "$CLIENT_DIR/url.txt" '@203.0.113.10:24443/?'
@@ -132,6 +138,7 @@ PUBLIC_IP="203.0.113.10"
 SERVER_ADDRESS="$PUBLIC_IP"
 
 HYSTERIA_CORE_OWNED="1"
+ACME_CERT_OWNED="1"
 save_installer_state
 has_valid_installer_state || fail "fresh installer state was not recognized"
 AUTH_PASSWORD="changed"
@@ -140,6 +147,7 @@ read_current_config
 assert_eq "$AUTH_PASSWORD" "auth-only-value"
 assert_eq "$OBFS_PASSWORD" "obfs-only-value"
 assert_eq "$HYSTERIA_CORE_OWNED" "1"
+assert_eq "$ACME_CERT_OWNED" "1"
 
 legacy_cert="$TEST_ROOT/legacy-cert.crt"
 legacy_key="$TEST_ROOT/legacy-key.pem"
@@ -187,6 +195,29 @@ ACME_OWNED="0"
 install_acme_client || fail "existing acme.sh was incorrectly treated as an install failure"
 assert_eq "$ACME_OWNED" "0"
 
+ACME_TEST_LOG="$TEST_ROOT/acme.log"
+export HY2_TEST_ACME_LOG="$ACME_TEST_LOG"
+cat >"$ACME_HOME/acme.sh" <<'EOF'
+#!/bin/sh
+case "$1" in
+    --list)
+        printf 'Main_Domain KeyLength SAN_Domains CA Created Renew\n'
+        printf 'example.com ec-256 no letsencrypt now later\n'
+        ;;
+    --remove) printf '%s\n' "$*" >>"$HY2_TEST_ACME_LOG" ;;
+esac
+EOF
+chmod 700 "$ACME_HOME/acme.sh"
+: >"$ACME_TEST_LOG"
+acme_has_certificate example.com || fail "existing ACME order was not found"
+! acme_has_certificate not-example.com || fail "partial ACME identifier match was accepted"
+CERT_MODE="domain-acme"; TLS_SNI="example.com"; ACME_OWNED="0"; ACME_CERT_OWNED="0"
+remove_acme_assets "$TLS_SNI"
+[[ ! -s "$ACME_TEST_LOG" ]] || fail "unowned ACME order was removed"
+ACME_CERT_OWNED="1"
+remove_acme_assets "$TLS_SNI"
+assert_contains "$ACME_TEST_LOG" '--remove -d example.com --ecc'
+
 transaction_root="$TEST_ROOT/transaction"
 CONFIG_DIR="$transaction_root/etc/hysteria"
 CONFIG_FILE="$CONFIG_DIR/config.yaml"
@@ -227,21 +258,39 @@ assert_contains "$MOCK_LOG" "systemctl enable $SERVICE_NAME"
 assert_contains "$MOCK_LOG" "systemctl start $SERVICE_NAME"
 [[ "$TRANSACTION_ACTIVE" == "0" ]] || fail "transaction remained active after rollback"
 
-# --- script update check (mock curl + auto-confirm) ---
-curl() {
-    local out=""
-    while (($# > 0)); do
-        [[ "$1" == "-o" ]] && { out="$2"; shift 2; continue; }
-        shift
-    done
-    cat >"$out" <<'EOF'
-#!/usr/bin/env bash
-readonly SCRIPT_VERSION="9.9.9"
-EOF
+# A failed restore must keep the snapshot for manual recovery.
+begin_transaction || fail "second transaction snapshot failed"
+FAILED_SNAPSHOT="$TRANSACTION_DIR"
+FAIL_RESTORE_COPY="1"
+cp() {
+    if [[ "$FAIL_RESTORE_COPY" == "1" && "${3:-}" == "$FAILED_SNAPSHOT/config_dir" ]]; then return 1; fi
+    command cp "$@"
 }
-read() { printf 'y\n'; confirm='y'; }
-check_script_update || fail "script update check failed"
-assert_contains "$MANAGEMENT_BIN" '9.9.9'
-[[ -x "$MANAGEMENT_BIN" ]] || fail "updated management binary is not executable"
+printf 'after-config\n' >"$CONFIG_FILE"
+if rollback_transaction; then fail "incomplete rollback was reported as successful"; fi
+[[ -d "$FAILED_SNAPSHOT" ]] || fail "failed rollback deleted its recovery snapshot"
+[[ "$TRANSACTION_ACTIVE" == "0" ]] || fail "failed rollback remained active"
+unset -f cp
+safe_remove_tree "$FAILED_SNAPSHOT"
+TRANSACTION_DIR=""
+
+cat >"$HYSTERIA_BIN" <<'EOF'
+#!/bin/sh
+printf 'Hysteria 2 version v2.12.2\n'
+EOF
+chmod 700 "$HYSTERIA_BIN"
+assert_eq "$(hysteria_core_version)" "2.12.2"
+
+# --install is idempotent; only --reinstall may enter the installation path.
+PREPARE_MARKER="$TEST_ROOT/prepare-called"
+require_root() { return 0; }
+has_valid_installer_state() { return 0; }
+prepare_runtime() { : >"$PREPARE_MARKER"; return 1; }
+mkdir -p "$CONFIG_DIR"
+: >"$CONFIG_FILE"
+quick_install 0 || fail "idempotent install returned failure"
+[[ ! -e "$PREPARE_MARKER" ]] || fail "idempotent install entered the installation path"
+if quick_install 1; then fail "mock reinstall unexpectedly completed"; fi
+[[ -e "$PREPARE_MARKER" ]] || fail "explicit reinstall did not enter the installation path"
 
 printf 'All tests passed.\n'

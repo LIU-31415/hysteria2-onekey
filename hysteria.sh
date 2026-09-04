@@ -4,9 +4,9 @@
 set -o pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.0.4"
+readonly SCRIPT_VERSION="2.0.5"
 readonly CORE_INSTALLER_URL="https://get.hy2.sh/"
-readonly REPO_RAW_URL="https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh"
+readonly MIN_SAFE_CORE_VERSION="2.9.2"
 
 if [[ "${HY2_TEST_MODE:-0}" == "1" ]]; then
     CONFIG_DIR="${HY2_CONFIG_DIR:-/etc/hysteria}"
@@ -47,9 +47,11 @@ TLS_INSECURE="0"
 TLS_PIN_SHA256=""
 ACME_CHALLENGE_PORT=""
 ACME_OWNED="0"
+ACME_CERT_OWNED="0"
 HYSTERIA_USER_OWNED="0"
 HYSTERIA_CORE_OWNED="0"
 FAILED_ACME_IDENTIFIER=""
+FAILED_ACME_CERT_OWNED="0"
 TRANSACTION_DIR=""
 TRANSACTION_ACTIVE="0"
 
@@ -65,6 +67,22 @@ warn() { printf '%b[注意]%b %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 error() { printf '%b[错误]%b %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 die() { error "$*"; return 1; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+hysteria_core_version() {
+    local output
+    output="$("$HYSTERIA_BIN" version 2>/dev/null)" || return 1
+    if [[ "$output" =~ v?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    else
+        return 1
+    fi
+}
+
+version_at_least() {
+    local current="$1" minimum="$2"
+    [[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$minimum" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    [[ "$(printf '%s\n%s\n' "$minimum" "$current" | sort -V | head -n 1)" == "$minimum" ]]
+}
 
 is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
 has_valid_installer_state() {
@@ -317,7 +335,7 @@ download_checked_script() {
 }
 
 install_hysteria_core() {
-    local installer
+    local installer installed_version
     installer="$(mktemp /tmp/hy2-core-installer.XXXXXX)" || return 1
     if ! download_checked_script "$CORE_INSTALLER_URL" "$installer"; then
         rm -f "$installer"
@@ -327,6 +345,8 @@ install_hysteria_core() {
     bash "$installer" || { rm -f "$installer"; return 1; }
     rm -f "$installer"
     [[ -x "$HYSTERIA_BIN" ]] || die "官方安装完成，但未找到内核：$HYSTERIA_BIN"
+    installed_version="$(hysteria_core_version)" || die "无法识别新安装的 Hysteria 内核版本。"
+    version_at_least "$installed_version" "$MIN_SAFE_CORE_VERSION" || die "新安装的 Hysteria 内核低于安全下限 v${MIN_SAFE_CORE_VERSION}。"
 }
 
 ensure_service_unit() {
@@ -442,53 +462,66 @@ restore_snapshot_path() {
     if [[ -d "$path" && ! -L "$path" ]]; then
         safe_remove_tree "$path" || return 1
     else
-        rm -f -- "$path"
+        rm -f -- "$path" || return 1
     fi
     if [[ "$existed" == "1" ]]; then
-        mkdir -p "$(dirname "$path")"
+        mkdir -p "$(dirname "$path")" || return 1
         cp -a -- "$TRANSACTION_DIR/$label" "$path" || return 1
     fi
 }
 
 rollback_transaction() {
+    local rollback_failed=0 snapshot_dir="$TRANSACTION_DIR"
     [[ "$TRANSACTION_ACTIVE" == "1" ]] || return 0
     warn "操作失败，正在恢复修改前状态。"
     systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-    restore_snapshot_path config_dir "$CONFIG_DIR" || true
-    restore_snapshot_path client_dir "$CLIENT_DIR" || true
-    restore_snapshot_path service_file "$SERVICE_FILE" || true
-    restore_snapshot_path service_template_file "$SERVICE_TEMPLATE_FILE" || true
-    restore_snapshot_path management_bin "$MANAGEMENT_BIN" || true
-    restore_snapshot_path hysteria_bin "$HYSTERIA_BIN" || true
+    restore_snapshot_path config_dir "$CONFIG_DIR" || rollback_failed=1
+    restore_snapshot_path client_dir "$CLIENT_DIR" || rollback_failed=1
+    restore_snapshot_path service_file "$SERVICE_FILE" || rollback_failed=1
+    restore_snapshot_path service_template_file "$SERVICE_TEMPLATE_FILE" || rollback_failed=1
+    restore_snapshot_path management_bin "$MANAGEMENT_BIN" || rollback_failed=1
+    restore_snapshot_path hysteria_bin "$HYSTERIA_BIN" || rollback_failed=1
     if [[ "$(state_get_from "$TRANSACTION_DIR/manifest" acme_home 2>/dev/null || printf '0')" == "0" && -x "$ACME_HOME/acme.sh" ]]; then
-        "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1 || true
+        "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1 || rollback_failed=1
     fi
-    restore_snapshot_path acme_home "$ACME_HOME" || true
-    restore_snapshot_path hysteria_home_dir "$HYSTERIA_HOME_DIR" || true
+    restore_snapshot_path acme_home "$ACME_HOME" || rollback_failed=1
+    restore_snapshot_path hysteria_home_dir "$HYSTERIA_HOME_DIR" || rollback_failed=1
     if [[ "$(state_get_from "$TRANSACTION_DIR/manifest" hysteria_user 2>/dev/null || printf '0')" == "0" ]] && id hysteria >/dev/null 2>&1; then
-        userdel hysteria >/dev/null 2>&1 || true
+        userdel hysteria >/dev/null 2>&1 || rollback_failed=1
     fi
-    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || rollback_failed=1
     if [[ -f "$SERVICE_FILE" ]]; then
         if [[ "$(state_get_from "$TRANSACTION_DIR/manifest" service_enabled 2>/dev/null || printf '0')" == "1" ]]; then
-            systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+            systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || rollback_failed=1
         else
-            systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+            systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || rollback_failed=1
         fi
         if [[ "$(state_get_from "$TRANSACTION_DIR/manifest" service_active 2>/dev/null || printf '0')" == "1" ]]; then
-            systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || true
+            systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || rollback_failed=1
         else
-            systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+            systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || rollback_failed=1
         fi
     fi
-    if [[ "$TRANSACTION_DIR" == /tmp/hy2-transaction.* ]]; then safe_remove_tree "$TRANSACTION_DIR" || true; fi
-    TRANSACTION_DIR=""; TRANSACTION_ACTIVE="0"
+    TRANSACTION_ACTIVE="0"
+    if ((rollback_failed != 0)); then
+        error "回滚未完整完成；恢复快照已保留：$snapshot_dir"
+        return 1
+    fi
+    if [[ "$snapshot_dir" == /tmp/hy2-transaction.* ]]; then
+        safe_remove_tree "$snapshot_dir" || { error "回滚已完成，但无法删除快照：$snapshot_dir"; return 1; }
+    fi
+    TRANSACTION_DIR=""
 }
 
 commit_transaction() {
+    local snapshot_dir="$TRANSACTION_DIR"
     [[ "$TRANSACTION_ACTIVE" == "1" ]] || return 0
-    if [[ "$TRANSACTION_DIR" == /tmp/hy2-transaction.* ]]; then safe_remove_tree "$TRANSACTION_DIR" || true; fi
-    TRANSACTION_DIR=""; TRANSACTION_ACTIVE="0"
+    TRANSACTION_ACTIVE="0"
+    if [[ "$snapshot_dir" == /tmp/hy2-transaction.* ]] && ! safe_remove_tree "$snapshot_dir"; then
+        error "操作已完成，但无法删除包含旧配置的快照：$snapshot_dir"
+        return 1
+    fi
+    TRANSACTION_DIR=""
 }
 
 on_signal() {
@@ -535,6 +568,23 @@ ensure_cron_available() {
         error "未找到 cron/crond 服务，无法保证证书自动续期。"
         return 1
     fi
+}
+
+acme_cron_present() {
+    has_cmd crontab && crontab -l 2>/dev/null | grep -Fq 'acme.sh --cron'
+}
+
+ensure_acme_cron_job() {
+    acme_cron_present && return 0
+    "$ACME_HOME/acme.sh" --install-cronjob >/dev/null 2>&1 || return 1
+    acme_cron_present
+}
+
+acme_has_certificate() {
+    local identifier="$1"
+    [[ -x "$ACME_HOME/acme.sh" ]] || return 1
+    "$ACME_HOME/acme.sh" --list 2>/dev/null |
+        awk -v identifier="$identifier" 'NR > 1 && $1 == identifier { found=1 } END { exit !found }'
 }
 
 install_acme_client() {
@@ -584,19 +634,26 @@ validate_certificate_pair() {
 }
 
 issue_acme_certificate() {
-    local identifier="$1" mode="$2" acme=("$ACME_HOME/acme.sh") challenge_args=()
+    local identifier="$1" mode="$2" order_preexisting=0 acme=("$ACME_HOME/acme.sh") challenge_args=()
+    FAILED_ACME_CERT_OWNED="0"
     ensure_cron_available || return 1
+    install_acme_client || return 1
+    acme_has_certificate "$identifier" && order_preexisting=1
     if [[ -f "$STATE_FILE" && -x "$ACME_HOME/acme.sh" ]] &&
         [[ "$(state_get cert_mode 2>/dev/null || true)" == "$mode" ]] &&
         [[ "$(state_get tls_sni 2>/dev/null || true)" == "$identifier" ]] &&
+        acme_has_certificate "$identifier" &&
         validate_certificate_pair "$CERT_FILE" "$KEY_FILE" "$identifier" &&
-        certificate_is_system_trusted "$CERT_FILE"; then
+        certificate_is_system_trusted "$CERT_FILE" &&
+        ensure_acme_cron_job; then
         ACME_CHALLENGE_PORT="$(state_get acme_challenge_port 2>/dev/null || true)"
         TLS_SNI="$identifier"; TLS_INSECURE="0"; TLS_PIN_SHA256=""
         info "现有可信证书仍有效，继续使用并保留自动续期。"
         return 0
     fi
-    install_acme_client || return 1
+    if [[ "$order_preexisting" != "1" ]]; then
+        ACME_CERT_OWNED="1"
+    fi
     select_acme_challenge_port || return 1
     if [[ "$ACME_CHALLENGE_PORT" == "443" ]]; then challenge_args=(--alpn); else challenge_args=(--standalone); fi
 
@@ -606,16 +663,18 @@ issue_acme_certificate() {
         info "申请 Let's Encrypt 域名证书（标识：$identifier）"
     fi
     "${acme[@]}" --set-default-ca --server letsencrypt >/dev/null || return 1
+    [[ "$order_preexisting" == "1" ]] || FAILED_ACME_CERT_OWNED="1"
     local issue_args=(--issue "${challenge_args[@]}" -d "$identifier" --server letsencrypt --keylength ec-256)
     [[ "$mode" == "ip-acme" ]] && issue_args+=(--certificate-profile shortlived --days -3)
     "${acme[@]}" "${issue_args[@]}" || return 1
     "${acme[@]}" --install-cert -d "$identifier" --ecc \
-        --key-file "$KEY_FILE" --fullchain-file "$CERT_FILE" \
-        --reloadcmd "systemctl try-restart $SERVICE_NAME || true" || return 1
+        --key-file "$KEY_FILE" --fullchain-file "$CERT_FILE" || return 1
     validate_certificate_pair "$CERT_FILE" "$KEY_FILE" "$identifier" || return 1
     certificate_is_system_trusted "$CERT_FILE" || { error "ACME 返回的证书链未通过系统信任校验。"; return 1; }
+    ensure_acme_cron_job || { error "无法建立 acme.sh 自动续期任务。"; return 1; }
     CURRENT_CERT_FILE="$CERT_FILE"; CURRENT_KEY_FILE="$KEY_FILE"
     TLS_SNI="$identifier"; TLS_INSECURE="0"; TLS_PIN_SHA256=""
+    FAILED_ACME_CERT_OWNED="0"
 }
 
 generate_self_signed_certificate() {
@@ -646,6 +705,7 @@ configure_existing_certificate() {
     mv -f "${KEY_FILE}.new" "$KEY_FILE" || return 1
     CURRENT_CERT_FILE="$CERT_FILE"; CURRENT_KEY_FILE="$KEY_FILE"
     TLS_SNI="$name"; TLS_INSECURE="0"; TLS_PIN_SHA256=""
+    warn "现有证书已复制到脚本目录；源证书续期后不会自动同步，请重新导入。"
 }
 
 configure_quick_certificate() {
@@ -657,18 +717,30 @@ configure_quick_certificate() {
     fi
     warn "可信 IP 证书申请失败，自动改用带指纹校验的自签名证书。"
     FAILED_ACME_IDENTIFIER="$PUBLIC_IP"
+    ACME_CERT_OWNED="0"
     CERT_MODE="selfsigned"; ACME_CHALLENGE_PORT=""
     generate_self_signed_certificate "$PUBLIC_IP"
 }
 
+remove_acme_order_if_owned() {
+    local identifier="$1" owned="$2"
+    [[ "$owned" == "1" && -n "$identifier" && -x "$ACME_HOME/acme.sh" ]] || return 0
+    "$ACME_HOME/acme.sh" --remove -d "$identifier" --ecc >/dev/null 2>&1 || {
+        warn "无法删除脚本创建的 ACME 证书订单：$identifier"
+        return 1
+    }
+}
+
 cleanup_previous_acme_certificate() {
-    local previous_mode="$1" previous_identifier="$2" remaining
+    local previous_mode="$1" previous_identifier="$2" previous_owned="$3" remaining
     [[ "$previous_mode" == "ip-acme" || "$previous_mode" == "domain-acme" ]] || return 0
     [[ -n "$previous_identifier" ]] || return 0
     if [[ "$previous_mode" == "$CERT_MODE" && "$previous_identifier" == "$TLS_SNI" ]]; then return 0; fi
-    [[ -x "$ACME_HOME/acme.sh" ]] || return 0
-    "$ACME_HOME/acme.sh" --remove -d "$previous_identifier" --ecc >/dev/null 2>&1 || true
-    if [[ "$CERT_MODE" != "ip-acme" && "$CERT_MODE" != "domain-acme" && "$ACME_OWNED" == "1" ]]; then
+    if [[ "$previous_identifier" == "$FAILED_ACME_IDENTIFIER" && "$previous_owned" != "1" ]]; then return 0; fi
+    if remove_acme_order_if_owned "$previous_identifier" "$previous_owned" && [[ "$previous_identifier" == "$FAILED_ACME_IDENTIFIER" ]]; then
+        FAILED_ACME_CERT_OWNED="0"
+    fi
+    if [[ -x "$ACME_HOME/acme.sh" && "$CERT_MODE" != "ip-acme" && "$CERT_MODE" != "domain-acme" && "$ACME_OWNED" == "1" ]]; then
         remaining="$("$ACME_HOME/acme.sh" --list 2>/dev/null | awk 'NR > 1 && NF {count++} END {print count+0}')"
         if [[ "$remaining" == "0" ]]; then
             "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1 || true
@@ -680,9 +752,8 @@ cleanup_previous_acme_certificate() {
 
 cleanup_failed_acme_attempt() {
     local remaining
-    [[ -n "$FAILED_ACME_IDENTIFIER" && -x "$ACME_HOME/acme.sh" ]] || return 0
-    "$ACME_HOME/acme.sh" --remove -d "$FAILED_ACME_IDENTIFIER" --ecc >/dev/null 2>&1 || true
-    if [[ "$CERT_MODE" != "ip-acme" && "$CERT_MODE" != "domain-acme" && "$ACME_OWNED" == "1" ]]; then
+    remove_acme_order_if_owned "$FAILED_ACME_IDENTIFIER" "$FAILED_ACME_CERT_OWNED" || true
+    if [[ -x "$ACME_HOME/acme.sh" && "$CERT_MODE" != "ip-acme" && "$CERT_MODE" != "domain-acme" && "$ACME_OWNED" == "1" ]]; then
         remaining="$("$ACME_HOME/acme.sh" --list 2>/dev/null | awk 'NR > 1 && NF {count++} END {print count+0}')"
         if [[ "$remaining" == "0" ]]; then
             "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1 || true
@@ -691,6 +762,7 @@ cleanup_failed_acme_attempt() {
         fi
     fi
     FAILED_ACME_IDENTIFIER=""
+    FAILED_ACME_CERT_OWNED="0"
 }
 
 save_installer_state() {
@@ -708,6 +780,7 @@ save_installer_state() {
         printf 'tls_pin_sha256=%s\n' "$TLS_PIN_SHA256"
         printf 'acme_challenge_port=%s\n' "$ACME_CHALLENGE_PORT"
         printf 'acme_owned=%s\n' "$ACME_OWNED"
+        printf 'acme_cert_owned=%s\n' "$ACME_CERT_OWNED"
         printf 'hysteria_user_owned=%s\n' "$HYSTERIA_USER_OWNED"
         printf 'hysteria_core_owned=%s\n' "$HYSTERIA_CORE_OWNED"
     } >"$temp" || return 1
@@ -733,20 +806,6 @@ obfs:
   type: salamander
   salamander:
     password: $(yaml_quote "$OBFS_PASSWORD")
-
-masquerade:
-  type: string
-  string:
-    content: "Not Found"
-    headers:
-      content-type: "text/plain; charset=utf-8"
-      cache-control: "no-store"
-    statusCode: 404
-
-sniff:
-  enable: true
-  timeout: 2s
-  rewriteDomain: false
 EOF
 }
 
@@ -826,6 +885,7 @@ EOF
 
     {
         printf '# Hysteria 2 client - native TUN mode (run as administrator/root)\n'
+        printf '# macOS: change tun.name below to utun followed by a number, for example utun123.\n'
         printf 'server: %s\n' "$(yaml_quote "$server_value")"
         printf 'auth: %s\n' "$(yaml_quote "$AUTH_PASSWORD")"
         printf 'obfs:\n  type: salamander\n  salamander:\n    password: %s\n' "$(yaml_quote "$OBFS_PASSWORD")"
@@ -905,11 +965,11 @@ certificate_is_system_trusted() {
     count="$(find "$temp" -maxdepth 1 -type f -name 'part-*.pem' | wc -l)"
     if [[ "$count" =~ ^[0-9]+$ ]] && ((count >= 1)); then
         if ((count == 1)); then
-            openssl verify "$temp/part-1.pem" >/dev/null 2>&1 && result=0
+            openssl verify -purpose sslserver "$temp/part-1.pem" >/dev/null 2>&1 && result=0
         else
             : >"$temp/chain.pem"
             for ((i=2; i<=count; i++)); do cat "$temp/part-${i}.pem" >>"$temp/chain.pem" || break; done
-            openssl verify -untrusted "$temp/chain.pem" "$temp/part-1.pem" >/dev/null 2>&1 && result=0
+            openssl verify -purpose sslserver -untrusted "$temp/chain.pem" "$temp/part-1.pem" >/dev/null 2>&1 && result=0
         fi
     fi
     safe_remove_tree "$temp" || true
@@ -919,6 +979,7 @@ certificate_is_system_trusted() {
 read_current_config() {
     local value listen has_state=0 legacy_cert legacy_key legacy_client legacy_insecure="" legacy_sni=""
     CURRENT_CERT_FILE="$CERT_FILE"; CURRENT_KEY_FILE="$KEY_FILE"
+    ACME_CERT_OWNED="0"
     if [[ -f "$STATE_FILE" ]]; then
         has_state=1
         SERVER_ADDRESS="$(state_get server_address 2>/dev/null || true)"
@@ -932,6 +993,7 @@ read_current_config() {
         TLS_PIN_SHA256="$(state_get tls_pin_sha256 2>/dev/null || true)"
         ACME_CHALLENGE_PORT="$(state_get acme_challenge_port 2>/dev/null || true)"
         ACME_OWNED="$(state_get acme_owned 2>/dev/null || printf '0')"
+        ACME_CERT_OWNED="$(state_get acme_cert_owned 2>/dev/null || printf '0')"
         HYSTERIA_USER_OWNED="$(state_get hysteria_user_owned 2>/dev/null || printf '0')"
         HYSTERIA_CORE_OWNED="$(state_get hysteria_core_owned 2>/dev/null || printf '0')"
     fi
@@ -1029,10 +1091,15 @@ ensure_install_scope_safe() {
 }
 
 install_core_and_unit() {
-    local user_preexisting=0
+    local user_preexisting=0 current_version
     id hysteria >/dev/null 2>&1 && user_preexisting=1
-    if [[ -x "$HYSTERIA_BIN" ]] && "$HYSTERIA_BIN" version >/dev/null 2>&1; then
-        info "保留当前可用的 Hysteria 内核；如需升级请使用菜单 7。"
+    if [[ -x "$HYSTERIA_BIN" ]] && current_version="$(hysteria_core_version)"; then
+        if ! version_at_least "$current_version" "$MIN_SAFE_CORE_VERSION"; then
+            error "现有 Hysteria 内核 v${current_version} 低于安全下限 v${MIN_SAFE_CORE_VERSION}，已拒绝继续。"
+            error "已由本脚本管理的节点可用菜单 7 更新；外部内核请先自行更新或移走。"
+            return 1
+        fi
+        info "保留当前 Hysteria 内核 v${current_version}；如需升级请使用菜单 7。"
     else
         install_hysteria_core || return 1
         HYSTERIA_CORE_OWNED="1"
@@ -1042,11 +1109,12 @@ install_core_and_unit() {
 }
 
 perform_install() {
-    local cert_strategy="$1" source_cert="${2:-}" source_key="${3:-}" previous_cert_mode="" previous_sni=""
+    local cert_strategy="$1" source_cert="${2:-}" source_key="${3:-}" previous_cert_mode="" previous_sni="" previous_acme_cert_owned="0"
     if [[ -f "$STATE_FILE" ]]; then
         previous_cert_mode="$(state_get cert_mode 2>/dev/null || true)"
         previous_sni="$(state_get tls_sni 2>/dev/null || true)"
         ACME_OWNED="$(state_get acme_owned 2>/dev/null || printf '0')"
+        previous_acme_cert_owned="$(state_get acme_cert_owned 2>/dev/null || printf '0')"
         HYSTERIA_USER_OWNED="$(state_get hysteria_user_owned 2>/dev/null || printf '0')"
         HYSTERIA_CORE_OWNED="$(state_get hysteria_core_owned 2>/dev/null || printf '0')"
     fi
@@ -1054,11 +1122,29 @@ perform_install() {
     if ! install_core_and_unit; then rollback_transaction; return 1; fi
 
     case "$cert_strategy" in
-        quick) configure_quick_certificate || { rollback_transaction; return 1; } ;;
-        ip-acme) CERT_MODE="ip-acme"; issue_acme_certificate "$PUBLIC_IP" ip-acme || { rollback_transaction; return 1; } ;;
-        domain-acme) CERT_MODE="domain-acme"; issue_acme_certificate "$TLS_SNI" domain-acme || { rollback_transaction; return 1; } ;;
-        existing) CERT_MODE="existing"; configure_existing_certificate "$source_cert" "$source_key" "$TLS_SNI" || { rollback_transaction; return 1; } ;;
-        selfsigned) CERT_MODE="selfsigned"; ACME_CHALLENGE_PORT=""; generate_self_signed_certificate "$TLS_SNI" || { rollback_transaction; return 1; } ;;
+        quick)
+            ACME_CERT_OWNED="0"
+            if [[ "$previous_cert_mode" == "ip-acme" && "$previous_sni" == "$PUBLIC_IP" ]]; then ACME_CERT_OWNED="$previous_acme_cert_owned"; fi
+            configure_quick_certificate || { rollback_transaction; return 1; }
+            ;;
+        ip-acme)
+            CERT_MODE="ip-acme"; ACME_CERT_OWNED="0"
+            if [[ "$previous_cert_mode" == "ip-acme" && "$previous_sni" == "$PUBLIC_IP" ]]; then ACME_CERT_OWNED="$previous_acme_cert_owned"; fi
+            issue_acme_certificate "$PUBLIC_IP" ip-acme || { rollback_transaction; return 1; }
+            ;;
+        domain-acme)
+            CERT_MODE="domain-acme"; ACME_CERT_OWNED="0"
+            if [[ "$previous_cert_mode" == "domain-acme" && "$previous_sni" == "$TLS_SNI" ]]; then ACME_CERT_OWNED="$previous_acme_cert_owned"; fi
+            issue_acme_certificate "$TLS_SNI" domain-acme || { rollback_transaction; return 1; }
+            ;;
+        existing)
+            CERT_MODE="existing"; ACME_CERT_OWNED="0"
+            configure_existing_certificate "$source_cert" "$source_key" "$TLS_SNI" || { rollback_transaction; return 1; }
+            ;;
+        selfsigned)
+            CERT_MODE="selfsigned"; ACME_CHALLENGE_PORT=""; ACME_CERT_OWNED="0"
+            generate_self_signed_certificate "$TLS_SNI" || { rollback_transaction; return 1; }
+            ;;
         *) rollback_transaction; return 1 ;;
     esac
 
@@ -1066,18 +1152,26 @@ perform_install() {
     if ! activate_server_config; then rollback_transaction; return 1; fi
     if ! generate_client_configs || ! install_management_command; then rollback_transaction; return 1; fi
     if ! secure_files; then rollback_transaction; return 1; fi
-    commit_transaction
+    commit_transaction || warn "请按上方路径人工删除旧配置快照。"
     cleanup_legacy_artifacts
-    cleanup_previous_acme_certificate "$previous_cert_mode" "$previous_sni"
+    cleanup_previous_acme_certificate "$previous_cert_mode" "$previous_sni" "$previous_acme_cert_owned"
     cleanup_failed_acme_attempt
     save_installer_state || warn "配置已生效，但安装器状态文件未能更新。"
     print_client_result
 }
 
 quick_install() {
+    local allow_reinstall="${1:-0}"
+    require_root || return 1
+    if has_valid_installer_state && [[ -f "$CONFIG_FILE" && "$allow_reinstall" != "1" ]]; then
+        install_management_command || return 1
+        info "检测到已有安装：配置保持不变，管理脚本已更新到 v${SCRIPT_VERSION}。明确重装请运行 hy2 --reinstall。"
+        return 0
+    fi
     prepare_runtime || return 1
     ensure_install_scope_safe || return 1
     FAILED_ACME_IDENTIFIER=""
+    FAILED_ACME_CERT_OWNED="0"
     SERVER_ADDRESS="$PUBLIC_IP"; SERVER_PORT="443"
     AUTH_PASSWORD="$(random_secret 32)" || return 1
     OBFS_PASSWORD="$(random_secret 32)" || return 1
@@ -1164,11 +1258,20 @@ show_config() {
 }
 
 diagnose() {
-    local failures=0 cert_end
+    local failures=0 cert_end current_version
     require_root || return 1
     printf 'Hysteria 2 诊断（脚本 %s）\n' "$SCRIPT_VERSION"
     if [[ -x "$HYSTERIA_BIN" ]]; then
-        printf '[OK] 内核：%s\n' "$("$HYSTERIA_BIN" version 2>/dev/null | head -n1)"
+        if current_version="$(hysteria_core_version)"; then
+            if version_at_least "$current_version" "$MIN_SAFE_CORE_VERSION"; then
+                printf '[OK] 内核：v%s（安全下限 v%s）\n' "$current_version" "$MIN_SAFE_CORE_VERSION"
+            else
+                printf '[FAIL] 内核 v%s 低于安全下限 v%s，请立即更新\n' "$current_version" "$MIN_SAFE_CORE_VERSION"
+                failures=$((failures + 1))
+            fi
+        else
+            printf '[FAIL] 无法识别 Hysteria 内核版本\n'; failures=$((failures + 1))
+        fi
     else
         printf '[FAIL] 未找到 Hysteria 内核：%s\n' "$HYSTERIA_BIN"; failures=$((failures + 1))
     fi
@@ -1204,12 +1307,12 @@ diagnose() {
         fi
     fi
     if [[ "$CERT_MODE" == "ip-acme" || "$CERT_MODE" == "domain-acme" ]]; then
-        if [[ -x "$ACME_HOME/acme.sh" ]] && "$ACME_HOME/acme.sh" --list 2>/dev/null | grep -Fq "$TLS_SNI"; then
+        if acme_has_certificate "$TLS_SNI"; then
             printf '[OK] ACME 续期配置存在\n'
         else
             printf '[FAIL] 未找到当前证书的 ACME 续期配置\n'; failures=$((failures + 1))
         fi
-        if has_cmd crontab && crontab -l 2>/dev/null | grep -Fq 'acme.sh --cron'; then
+        if acme_cron_present; then
             printf '[OK] ACME 定时续期任务存在\n'
         else
             printf '[FAIL] 未找到 ACME 定时续期任务\n'; failures=$((failures + 1))
@@ -1221,6 +1324,12 @@ diagnose() {
         fi
         if [[ -n "$ACME_CHALLENGE_PORT" ]] && tcp_port_in_use "$ACME_CHALLENGE_PORT"; then
             printf '[WARN] TCP %s 当前被占用，下一次独立 ACME 验证可能无法绑定该端口\n' "$ACME_CHALLENGE_PORT"
+        fi
+    fi
+    if [[ "$CERT_MODE" == "existing" ]]; then
+        printf '[WARN] 当前证书是一次性导入副本；源证书续期后需重新导入\n'
+        if ! openssl x509 -in "$CURRENT_CERT_FILE" -checkend 2592000 -noout >/dev/null 2>&1; then
+            printf '[WARN] 导入证书将在 30 天内到期\n'
         fi
     fi
     if [[ -f "$CLIENT_DIR/hy-client-tun.yaml" ]] && grep -qF "$PUBLIC_IP/" "$CLIENT_DIR/hy-client-tun.yaml"; then
@@ -1247,33 +1356,6 @@ service_menu() {
     esac
 }
 
-check_script_update() {
-    local tmp_file="/tmp/hy2-latest.sh" current="$SCRIPT_VERSION" new="" confirm=""
-    info "正在从 GitHub 下载最新脚本…"
-    if ! curl -fL --retry 3 --connect-timeout 10 --max-time 60 "$REPO_RAW_URL" -o "$tmp_file"; then
-        error "下载最新脚本失败，请检查网络。"
-        return 1
-    fi
-    [[ "$(head -n 1 "$tmp_file")" == '#!/usr/bin/env bash' ]] || { error "下载内容不是有效脚本（shebang 校验失败）。"; rm -f "$tmp_file"; return 1; }
-    bash -n "$tmp_file" || { error "下载脚本语法检查失败。"; rm -f "$tmp_file"; return 1; }
-    new="$(sed -n 's/^readonly SCRIPT_VERSION="\([^"]*\)"/\1/p' "$tmp_file" | head -n 1)"
-    [[ -n "$new" ]] || { error "无法识别下载脚本的版本号。"; rm -f "$tmp_file"; return 1; }
-    if [[ "$new" == "$current" ]]; then
-        info "当前已是最新版本：$current"
-        rm -f "$tmp_file"
-        return 0
-    fi
-    info "发现新版本：$current → $new"
-    read -r -p "是否立即安装新版本？（下载文件未经签名验证，请确认来源可信后选择）(y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        install -m 755 "$tmp_file" "$MANAGEMENT_BIN" || { error "安装失败。"; rm -f "$tmp_file"; return 1; }
-        rm -f "$tmp_file"
-        success "已更新 $MANAGEMENT_BIN，下次运行 hy2 即生效（v$new）。"
-        return 0
-    fi
-    warn "已保留下载文件：$tmp_file；可手动执行：install -m 755 $tmp_file $MANAGEMENT_BIN"
-}
-
 update_core() {
     require_root || return 1
     detect_os || return 1
@@ -1285,7 +1367,7 @@ update_core() {
     fi
     sleep 2
     if ! systemctl is-active --quiet "$SERVICE_NAME"; then rollback_transaction; return 1; fi
-    commit_transaction
+    commit_transaction || warn "请按上方路径人工删除旧内核快照。"
     success "内核已更新，服务运行正常。"
 }
 
@@ -1293,7 +1375,11 @@ remove_acme_assets() {
     local identifier="$1" remaining
     [[ -x "$ACME_HOME/acme.sh" ]] || return 0
     if [[ "$CERT_MODE" == "ip-acme" || "$CERT_MODE" == "domain-acme" ]]; then
-        "$ACME_HOME/acme.sh" --remove -d "$identifier" --ecc >/dev/null 2>&1 || true
+        if [[ "$ACME_CERT_OWNED" == "1" ]]; then
+            remove_acme_order_if_owned "$identifier" "$ACME_CERT_OWNED" || true
+        else
+            warn "当前 ACME 证书订单不是本脚本创建的，已保留：$identifier"
+        fi
     fi
     [[ "$ACME_OWNED" == "1" ]] || return 0
     remaining="$("$ACME_HOME/acme.sh" --list 2>/dev/null | awk 'NR > 1 && NF {count++} END {print count+0}')"
@@ -1362,7 +1448,7 @@ main_menu() {
         print_header
         if [[ -f "$CONFIG_FILE" ]]; then default_choice=3; else default_choice=1; fi
         cat <<'EOF'
-  1) 一键安装 / 重装（全自动推荐配置）
+  1) 一键安装（已安装时仅更新管理脚本）
   2) 自定义安装 / 修改
   3) 查看配置与分享链接
   4) 重新生成客户端配置
@@ -1370,7 +1456,6 @@ main_menu() {
   6) 一键诊断
   7) 更新 Hysteria 内核
   8) 安全卸载
-  9) 检查脚本更新（确认后安装）
   0) 退出
 EOF
         read -r -p "请选择 [${default_choice}]: " choice
@@ -1386,7 +1471,6 @@ EOF
             6) diagnose || true ;;
             7) update_core || true ;;
             8) uninstall_hysteria || true ;;
-            9) check_script_update || true ;;
             0) return 0 ;;
             *) warn "无效选项，请输入 0-8。" ;;
         esac
@@ -1397,11 +1481,10 @@ EOF
 print_help() {
     cat <<EOF
 用法：bash hysteria.sh [选项]
-  --install       全自动安装（默认 UDP 443）
-  --reinstall     使用全新随机密码重装
+  --install       全自动安装；已有安装仅更新管理脚本
+  --reinstall     明确重装并轮换认证与混淆密码
   --diagnose      本机诊断
   --uninstall     安全卸载（仍需输入 UNINSTALL）
-  --check-update  检查脚本更新（确认后安装）
   --version       显示版本
   --help          显示帮助
 EOF
@@ -1409,10 +1492,10 @@ EOF
 
 main() {
     case "${1:-}" in
-        --install|--reinstall) quick_install ;;
+        --install) quick_install 0 ;;
+        --reinstall) quick_install 1 ;;
         --diagnose) diagnose ;;
         --uninstall) uninstall_hysteria ;;
-        --check-update) check_script_update ;;
         --version) printf '%s\n' "$SCRIPT_VERSION" ;;
         --help|-h) print_help ;;
         "") main_menu ;;

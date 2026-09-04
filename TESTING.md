@@ -30,11 +30,11 @@ sudo hy2 --diagnose
 
 - `hysteria-server.service` 为 `active`；
 - 诊断没有 `[FAIL]`；
+- 诊断显示内核版本不低于安全下限 `2.9.2`；
 - `/root/hy/url.txt`、`hy-client.yaml`、`hy-client-tun.yaml` 均存在且权限为 `600`；
 - `/etc/hysteria/server.key` 权限不是全局可读；
 - 可信证书模式下存在 acme.sh 续期条目；自签名回退模式下链接和 YAML 均包含 `pinSHA256`。
 - 诊断能识别带引号路径的 acme.sh cron 条目（v2.0.2+），且 cron 服务处于运行状态。
-- 菜单 `9` / `hy2 --check-update` 能下载并显示当前版本号，确认后才安装。
 - 脚本不会修改本机防火墙；云安全组和已有本机防火墙必须由你自行放行端口。
 
 ```bash
@@ -52,11 +52,19 @@ journalctl -u hysteria-server.service -n 50 --no-pager
 4. 验证网页、DNS、长连接和 UDP 应用；
 5. 切换网络后再次测试，排除单一运营商封锁 UDP 的影响。
 
+macOS 测试前把 `tun.name` 改成 `utun` 加数字，例如 `utun123`。
+
 如果普通代理成功、只有第三方客户端 TUN 失败，重点核对客户端导入后是否保留 `SNI`、`insecure` 和 `pinSHA256`。可信 IP 证书模式不应开启 `insecure`。
 
 ## 4. 重装与失败回滚
 
-再次运行：
+先再次执行安装命令，确认它不会轮换现有密码：
+
+```bash
+sudo bash hysteria.sh --install
+```
+
+然后明确重装：
 
 ```bash
 sudo hy2 --reinstall
@@ -66,6 +74,7 @@ sudo hy2 --diagnose
 验收条件：
 
 - 已有可用内核不会被隐式升级；
+- 低于 `2.9.2` 的旧内核会被拒绝；
 - 密码和客户端文件更新；
 - 服务保持运行；
 - 配置备份最多保留 3 份。
@@ -89,4 +98,4 @@ test ! -e /etc/systemd/system/hysteria-server.service
 test ! -e /etc/systemd/system/hysteria-server@.service
 ```
 
-如果安装前已经存在 `hysteria` 用户或 acme.sh，脚本会保留它们；如果由脚本首次创建且没有其他 ACME 证书，则应一并清理。云平台安全组不会自动删除，需要按需手动收回端口。
+如果安装前已经存在 `hysteria` 用户、acme.sh 或同名 ACME 证书订单，脚本会保留它们；如果 acme.sh 和证书订单均由脚本首次创建且没有其他 ACME 证书，则应一并清理。云平台安全组不会自动删除，需要按需手动收回端口。
