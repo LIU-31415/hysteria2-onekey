@@ -4,7 +4,7 @@
 set -o pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.0.5"
+readonly SCRIPT_VERSION="2.0.6"
 readonly CORE_INSTALLER_URL="https://get.hy2.sh/"
 readonly MIN_SAFE_CORE_VERSION="2.9.2"
 
@@ -633,6 +633,19 @@ validate_certificate_pair() {
     fi
 }
 
+warn_certificate_client_compatibility() {
+    local details
+    if ! details="$(LC_ALL=C openssl x509 -in "$1" -noout -text 2>/dev/null)"; then
+        warn "无法读取证书公钥算法，客户端兼容性尚未确认。"
+        return 0
+    fi
+    if grep -Eiq '^[[:space:]]*Public Key Algorithm:[[:space:]]*ED25519[[:space:]]*$' <<<"$details"; then
+        warn "证书使用 Ed25519 公钥，与官方 Hysteria 客户端默认的 Chrome QUIC 指纹模拟不兼容；保持该默认设置时握手会失败。"
+        warn "建议改用 ECDSA 或 RSA 证书，并保持原有证书验证设置；第三方客户端请核对其实际内核的兼容性。"
+    fi
+    return 0
+}
+
 issue_acme_certificate() {
     local identifier="$1" mode="$2" order_preexisting=0 acme=("$ACME_HOME/acme.sh") challenge_args=()
     FAILED_ACME_CERT_OWNED="0"
@@ -698,6 +711,7 @@ configure_existing_certificate() {
     [[ -r "$source_cert" && -r "$source_key" ]] || { error "证书或私钥不可读。"; return 1; }
     validate_certificate_pair "$source_cert" "$source_key" "$name" || return 1
     certificate_is_system_trusted "$source_cert" || { error "现有证书不受系统信任；请改选【自签名 + 指纹校验】。"; return 1; }
+    warn_certificate_client_compatibility "$source_cert"
     mkdir -p "$CONFIG_DIR" || return 1
     install -m 640 "$source_cert" "${CERT_FILE}.new" || return 1
     install -m 640 "$source_key" "${KEY_FILE}.new" || { rm -f "${CERT_FILE}.new"; return 1; }
@@ -1294,6 +1308,7 @@ diagnose() {
     if [[ -f "$CURRENT_CERT_FILE" && -f "$CURRENT_KEY_FILE" ]] && validate_certificate_pair "$CURRENT_CERT_FILE" "$CURRENT_KEY_FILE" "$TLS_SNI"; then
         cert_end="$(openssl x509 -in "$CURRENT_CERT_FILE" -noout -enddate 2>/dev/null | cut -d= -f2-)"
         printf '[OK] 证书、私钥及 SAN 匹配；到期：%s\n' "$cert_end"
+        warn_certificate_client_compatibility "$CURRENT_CERT_FILE"
     else
         printf '[FAIL] 证书检查失败\n'; failures=$((failures + 1))
     fi

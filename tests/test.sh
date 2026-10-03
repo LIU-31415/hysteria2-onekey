@@ -21,6 +21,18 @@ case "$(uname -s)" in
             done
             command openssl "${openssl_args[@]}"
         }
+        # Windows 没有 Linux 的 root 用户；本地只检查复制和权限模式。
+        # Linux 下仍执行真实的属主设置，实机属主验收见 TESTING.md。
+        install() {
+            local -a install_args=()
+            while (($#)); do
+                case "$1" in
+                    -o|-g) shift 2 ;;
+                    *) install_args+=("$1"); shift ;;
+                esac
+            done
+            command install "${install_args[@]}"
+        }
         ;;
 esac
 
@@ -127,6 +139,58 @@ assert_contains "$CLIENT_DIR/hy-client.yaml" 'insecure: true'
 assert_contains "$CLIENT_DIR/hy-client.yaml" 'pinSHA256:'
 assert_contains "$CLIENT_DIR/url.txt" 'insecure=1'
 assert_contains "$CLIENT_DIR/url.txt" 'pinSHA256='
+
+# Detect the leaf public key, not the CA signature algorithm.
+compat_log="$TEST_ROOT/certificate-compatibility.log"
+warn_certificate_client_compatibility "$CERT_FILE" >"$compat_log" 2>&1
+[[ ! -s "$compat_log" ]] || fail "RSA certificate triggered a compatibility warning"
+ed_cert="$TEST_ROOT/ed25519.crt"
+ed_key="$TEST_ROOT/ed25519.key"
+openssl req -x509 -nodes -newkey ed25519 -days 2 \
+    -keyout "$ed_key" -out "$ed_cert" -subj "/CN=$PUBLIC_IP" \
+    -addext "subjectAltName=IP:$PUBLIC_IP" >/dev/null 2>&1
+warn_certificate_client_compatibility "$ed_cert" >"$compat_log" 2>&1
+assert_contains "$compat_log" 'Ed25519 公钥'
+assert_contains "$compat_log" 'ECDSA 或 RSA'
+ecdsa_cert="$TEST_ROOT/ecdsa.crt"
+openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 2 \
+    -keyout "$TEST_ROOT/ecdsa.key" -out "$ecdsa_cert" -subj "/CN=$PUBLIC_IP" >/dev/null 2>&1
+warn_certificate_client_compatibility "$ecdsa_cert" >"$compat_log" 2>&1
+[[ ! -s "$compat_log" ]] || fail "ECDSA certificate triggered a compatibility warning"
+openssl req -new -key "$KEY_FILE" -out "$TEST_ROOT/rsa.csr" -subj "/CN=$PUBLIC_IP" >/dev/null 2>&1
+openssl x509 -req -in "$TEST_ROOT/rsa.csr" -CA "$ed_cert" -CAkey "$ed_key" \
+    -set_serial 1 -days 2 -out "$TEST_ROOT/rsa-ed25519-signed.crt" >/dev/null 2>&1
+warn_certificate_client_compatibility "$TEST_ROOT/rsa-ed25519-signed.crt" >"$compat_log" 2>&1
+[[ ! -s "$compat_log" ]] || fail "Ed25519 CA signature was mistaken for the leaf public key"
+
+(
+    CERT_FILE="$TEST_ROOT/imported.crt"; KEY_FILE="$TEST_ROOT/imported.key"
+    if configure_existing_certificate "$ed_cert" "$ed_key" "$PUBLIC_IP" >"$compat_log" 2>&1; then
+        fail "compatibility warning allowed an untrusted certificate to be imported"
+    fi
+    [[ ! -e "$CERT_FILE" ]] || fail "untrusted certificate was copied before rejection"
+    # Trust is mocked only for the import/diagnosis integration checks below.
+    certificate_is_system_trusted() { return 0; }
+    configure_existing_certificate "$ed_cert" "$ed_key" "$PUBLIC_IP" >"$compat_log" 2>&1
+    assert_contains "$compat_log" 'Ed25519 公钥'
+    validate_certificate_pair "$CERT_FILE" "$KEY_FILE" "$PUBLIC_IP" || fail "imported certificate pair is invalid"
+    assert_eq "$TLS_INSECURE" "0"
+    assert_eq "$TLS_PIN_SHA256" ""
+    if configure_existing_certificate "$ed_cert" "$TEST_ROOT/ecdsa.key" "$PUBLIC_IP" >"$compat_log" 2>&1; then
+        fail "mismatched private key was accepted during import"
+    fi
+    HYSTERIA_BIN="$TEST_ROOT/diagnostic-hysteria"
+    printf '#!/bin/sh\nprintf "Hysteria 2 version v2.12.3\\n"\n' >"$HYSTERIA_BIN"
+    chmod 700 "$HYSTERIA_BIN"
+    require_root() { return 0; }
+    read_current_config() { return 0; }
+    systemctl() { return 0; }
+    ss() { printf ':24443\n'; }
+    CERT_MODE="existing"
+    diagnose >"$compat_log" 2>&1 || fail "compatibility warning was treated as a diagnostic failure"
+    assert_contains "$compat_log" 'Ed25519 公钥'
+    assert_not_contains "$compat_log" '[FAIL]'
+)
 
 PUBLIC_IP="2001:db8::1"
 SERVER_ADDRESS="$PUBLIC_IP"
