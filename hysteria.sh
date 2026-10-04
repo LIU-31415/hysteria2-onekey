@@ -4,8 +4,9 @@
 set -o pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.0.6"
+readonly SCRIPT_VERSION="2.0.7"
 readonly CORE_INSTALLER_URL="https://get.hy2.sh/"
+readonly REPO_RAW_URL="https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh"
 readonly MIN_SAFE_CORE_VERSION="2.9.2"
 
 if [[ "${HY2_TEST_MODE:-0}" == "1" ]]; then
@@ -328,7 +329,7 @@ ensure_hysteria_user() {
 
 download_checked_script() {
     local url="$1" output="$2"
-    curl -fL --retry 3 --connect-timeout 10 --max-time 120 "$url" -o "$output" || return 1
+    curl -fL --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 10 --max-time 120 "$url" -o "$output" || return 1
     [[ "$(head -n 1 "$output")" == '#!'* ]] || { error "下载内容不是脚本：$url"; return 1; }
     bash -n "$output" || { error "下载脚本语法检查失败：$url"; return 1; }
     chmod 700 "$output"
@@ -1064,6 +1065,37 @@ install_management_command() {
     atomic_install_file "$source_path" "$MANAGEMENT_BIN" 755 root root
 }
 
+update_script() (
+    local candidate remote_version
+    require_root || return 1
+    managed_paths_are_safe || { error "托管路径检查失败，已拒绝更新管理脚本。"; return 1; }
+    if ! has_valid_installer_state || [[ ! -f "$CONFIG_FILE" || ! -f "$MANAGEMENT_BIN" || -L "$MANAGEMENT_BIN" ]]; then
+        error "未找到本脚本的有效安装或管理命令路径异常，请先使用下载的脚本安装。"
+        return 1
+    fi
+    candidate="$(mktemp /tmp/hy2-script-update.XXXXXX)" || return 1
+    trap 'rm -f -- "$candidate"' EXIT
+    info "从 GitHub 检查管理脚本更新（当前 v${SCRIPT_VERSION}）"
+    if ! download_checked_script "$REPO_RAW_URL" "$candidate"; then
+        error "下载或语法检查失败，现有管理脚本保持不变。"
+        return 1
+    fi
+    remote_version="$(sed -nE 's/^readonly SCRIPT_VERSION="([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' "$candidate")"
+    if [[ "$(head -n 1 "$candidate")" != '#!/usr/bin/env bash' || ! "$remote_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        error "下载内容的脚本标识或版本无效，现有管理脚本保持不变。"
+        return 1
+    fi
+    if version_at_least "$SCRIPT_VERSION" "$remote_version"; then
+        info "当前 v${SCRIPT_VERSION} 不低于 GitHub 版本 v${remote_version}，无需更新。"
+        return 0
+    fi
+    if ! atomic_install_file "$candidate" "$MANAGEMENT_BIN" 755 root root; then
+        error "管理脚本替换失败，旧脚本已保留。"
+        return 1
+    fi
+    success "管理脚本已更新到 v${remote_version}；请重新运行 hy2 使用新版。"
+)
+
 print_client_result() {
     local url
     url="$(cat "$CLIENT_DIR/url.txt")"
@@ -1179,7 +1211,7 @@ quick_install() {
     require_root || return 1
     if has_valid_installer_state && [[ -f "$CONFIG_FILE" && "$allow_reinstall" != "1" ]]; then
         install_management_command || return 1
-        info "检测到已有安装：配置保持不变，管理脚本已更新到 v${SCRIPT_VERSION}。明确重装请运行 hy2 --reinstall。"
+        info "已有安装：配置保持不变，管理命令使用当前脚本 v${SCRIPT_VERSION}。从 GitHub 更新请运行 hy2 --update-script。"
         return 0
     fi
     prepare_runtime || return 1
@@ -1463,7 +1495,7 @@ main_menu() {
         print_header
         if [[ -f "$CONFIG_FILE" ]]; then default_choice=3; else default_choice=1; fi
         cat <<'EOF'
-  1) 一键安装（已安装时仅更新管理脚本）
+  1) 一键安装（已安装时从 GitHub 更新管理脚本）
   2) 自定义安装 / 修改
   3) 查看配置与分享链接
   4) 重新生成客户端配置
@@ -1471,12 +1503,19 @@ main_menu() {
   6) 一键诊断
   7) 更新 Hysteria 内核
   8) 安全卸载
+  9) 从 GitHub 更新管理脚本
   0) 退出
 EOF
         read -r -p "请选择 [${default_choice}]: " choice
         choice="${choice:-$default_choice}"
         case "$choice" in
-            1) quick_install || true ;;
+            1)
+                if has_valid_installer_state && [[ -f "$CONFIG_FILE" ]]; then
+                    if update_script; then return 0; fi
+                else
+                    quick_install || true
+                fi
+                ;;
             2) custom_install || true ;;
             3) show_config || true ;;
             4)
@@ -1486,8 +1525,9 @@ EOF
             6) diagnose || true ;;
             7) update_core || true ;;
             8) uninstall_hysteria || true ;;
+            9) if update_script; then return 0; fi ;;
             0) return 0 ;;
-            *) warn "无效选项，请输入 0-8。" ;;
+            *) warn "无效选项，请输入 0-9。" ;;
         esac
         printf '\n'
     done
@@ -1496,7 +1536,8 @@ EOF
 print_help() {
     cat <<EOF
 用法：bash hysteria.sh [选项]
-  --install       全自动安装；已有安装仅更新管理脚本
+  --install       全自动安装；已有安装仅将当前脚本安装为管理命令
+  --update-script 从 GitHub 更新管理脚本，保留节点配置
   --reinstall     明确重装并轮换认证与混淆密码
   --diagnose      本机诊断
   --uninstall     安全卸载（仍需输入 UNINSTALL）
@@ -1508,6 +1549,7 @@ EOF
 main() {
     case "${1:-}" in
         --install) quick_install 0 ;;
+        --update-script) update_script ;;
         --reinstall) quick_install 1 ;;
         --diagnose) diagnose ;;
         --uninstall) uninstall_hysteria ;;
