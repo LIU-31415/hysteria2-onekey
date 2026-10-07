@@ -2,7 +2,8 @@
 # Variables assigned here are consumed indirectly by functions from hysteria.sh.
 # shellcheck disable=SC2034
 
-set -euo pipefail
+set -Eeuo pipefail
+trap 'printf "FAIL at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
 # Git Bash (MSYS2/MINGW) 会把 /CN=... 之类的参数误转成 Windows 路径；
 # 关闭自动转换后，路径参数需手动转成 Windows 形式（openssl 是原生程序）。
@@ -40,6 +41,7 @@ TEST_ROOT="$(mktemp -d /tmp/hy2-tests.XXXXXX)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
 export HY2_TEST_MODE=1
+export HY2_TEST_ROOT="$TEST_ROOT"
 export HY2_CONFIG_DIR="$TEST_ROOT/etc/hysteria"
 export HY2_CLIENT_DIR="$TEST_ROOT/root/hy"
 export HY2_BACKUP_DIR="$TEST_ROOT/etc/hysteria/backups"
@@ -70,6 +72,10 @@ valid_hostname example.com || fail "valid hostname rejected"
 ! valid_hostname '-bad.example' || fail "invalid hostname accepted"
 valid_port 443 || fail "valid port rejected"
 ! valid_port 65536 || fail "invalid port accepted"
+! valid_port 18446744073709551617 || fail "overflowing port accepted"
+! valid_port 000443 || fail "overlong port accepted"
+! valid_ipv4 $'1.2.3.4\n9.9.9.9' || fail "multiline IPv4 accepted"
+! valid_ipv4 '1.2.3.4.' || fail "IPv4 with a trailing dot accepted"
 valid_secret '中文-pass_123' || fail "valid secret rejected"
 ! valid_secret $'bad\tsecret' || fail "secret containing a control character was accepted"
 version_at_least 2.9.2 2.9.2 || fail "equal safe version was rejected"
@@ -89,6 +95,23 @@ quoted="$(yaml_quote '  leading and trailing  ')"
 assert_eq "$(yaml_unquote "$quoted")" '  leading and trailing  '
 assert_eq "$(yaml_unquote "  '  single quoted  '  ")" '  single quoted  '
 assert_eq "$(uri_encode '中文 pass')" '%E4%B8%AD%E6%96%87%20pass'
+(
+    od() { return 1; }
+    if uri_encode nonempty; then fail "URI encoding swallowed an od failure"; fi
+)
+(
+    require_root() { return 0; }
+    CONFIG_FILE="$TEST_ROOT/missing-config"
+    quick_install() { fail "EOF triggered the default install"; }
+    main_menu </dev/null >/dev/null
+    if prompt_value example default </dev/null 2>/dev/null; then fail "EOF was treated as Enter"; fi
+    if prompt_port_settings </dev/null 2>/dev/null; then fail "port prompt ignored EOF"; fi
+    if prompt_certificate_strategy <<<'2' >/dev/null; then fail "domain prompt ignored EOF"; fi
+)
+if bash -s -- --version <"$(dirname "$0")/../hysteria.sh" >"$TEST_ROOT/stdin.log" 2>&1; then
+    fail "stdin invocation silently succeeded"
+fi
+assert_contains "$TEST_ROOT/stdin.log" '请先下载为 hysteria.sh'
 
 mkdir -p "$CONFIG_DIR" "$CLIENT_DIR"
 managed_paths_are_safe || fail "normal managed paths were rejected"
@@ -129,7 +152,18 @@ assert_contains "$CLIENT_DIR/hy-client-tun.yaml" 'macOS: change tun.name'
 assert_not_contains "$CLIENT_DIR/url.txt" 'mport='
 assert_not_contains "$CLIENT_DIR/url.txt" 'insecure='
 assert_contains "$CLIENT_DIR/url.txt" '@203.0.113.10:24443/?'
+(
+    SERVER_ADDRESS="2001:db8::10"
+    generate_client_configs
+    assert_contains "$CLIENT_DIR/hy-client-tun.yaml" '203.0.113.10/32'
+    assert_contains "$CLIENT_DIR/hy-client-tun.yaml" '2001:db8::10/128'
+    client_tun_excludes_server || fail "diagnosis did not find both server exclusions"
+    sed -i '/2001:db8::10\/128/d' "$CLIENT_DIR/hy-client-tun.yaml"
+    if client_tun_excludes_server; then fail "diagnosis accepted a missing connection IP exclusion"; fi
+)
+generate_client_configs
 
+CERT_MODE="selfsigned"
 generate_self_signed_certificate "$PUBLIC_IP"
 assert_eq "$TLS_INSECURE" "1"
 [[ -n "$TLS_PIN_SHA256" ]] || fail "self-signed fingerprint is empty"
@@ -212,6 +246,22 @@ assert_eq "$AUTH_PASSWORD" "auth-only-value"
 assert_eq "$OBFS_PASSWORD" "obfs-only-value"
 assert_eq "$HYSTERIA_CORE_OWNED" "1"
 assert_eq "$ACME_CERT_OWNED" "1"
+(
+    STATE_FILE="$TEST_ROOT/incomplete-state.conf"
+    printf 'version=%s\n' "$SCRIPT_VERSION" >"$STATE_FILE"
+    if state_get missing; then fail "missing state key returned success"; fi
+    if load_installer_state; then fail "incomplete installer state was accepted"; fi
+    begin_transaction() { fail "incomplete state reached an installation transaction"; }
+    if perform_install selfsigned 2>/dev/null; then fail "incomplete state was overwritten by reinstall"; fi
+    load_resource_ownership
+    assert_eq "$ACME_OWNED" 0
+    assert_eq "$HYSTERIA_CORE_OWNED" 0
+)
+(
+    CONFIG_DIR="$TEST_ROOT/../outside-test-root"
+    if test_paths_are_safe; then fail "test path outside root was accepted"; fi
+    if is_safe_tree_path "$CONFIG_DIR"; then fail "unsafe test tree was accepted"; fi
+)
 
 legacy_cert="$TEST_ROOT/legacy-cert.crt"
 legacy_key="$TEST_ROOT/legacy-key.pem"
@@ -258,6 +308,19 @@ chmod 700 "$ACME_HOME/acme.sh"
 ACME_OWNED="0"
 install_acme_client || fail "existing acme.sh was incorrectly treated as an install failure"
 assert_eq "$ACME_OWNED" "0"
+(
+    for version in 3.1.3 3.1.4; do
+        printf '#!/bin/sh\nprintf "v%s\\n"\n' "$version" >"$ACME_HOME/acme.sh"
+        if [[ "$version" == 3.1.3 ]]; then
+            if check_acme_version 2>/dev/null; then fail "old acme.sh was accepted for short-lived certificates"; fi
+            ensure_cron_available() { return 0; }
+            acme_has_certificate() { fail "old acme.sh reached certificate reuse"; }
+            if issue_acme_certificate "$PUBLIC_IP" ip-acme 2>/dev/null; then fail "old acme.sh reached issuance"; fi
+        else
+            check_acme_version || fail "supported acme.sh was rejected"
+        fi
+    done
+)
 
 ACME_TEST_LOG="$TEST_ROOT/acme.log"
 export HY2_TEST_ACME_LOG="$ACME_TEST_LOG"
@@ -281,6 +344,32 @@ remove_acme_assets "$TLS_SNI"
 ACME_CERT_OWNED="1"
 remove_acme_assets "$TLS_SNI"
 assert_contains "$ACME_TEST_LOG" '--remove -d example.com --ecc'
+(
+    ACME_OWNED=1
+    CERT_MODE=selfsigned
+    cat >"$ACME_HOME/acme.sh" <<'EOF'
+#!/bin/sh
+case "$1" in
+    --list) exit 1 ;;
+    --uninstall) printf 'unexpected-uninstall\n' >>"$HY2_TEST_ACME_LOG" ;;
+esac
+EOF
+    if remove_acme_assets unused 2>/dev/null; then fail "failed ACME listing was treated as empty"; fi
+    if cleanup_previous_acme_certificate ip-acme old-ip 0 2>/dev/null; then fail "previous ACME cleanup ignored listing failure"; fi
+    FAILED_ACME_IDENTIFIER=""; FAILED_ACME_CERT_OWNED=0
+    if cleanup_failed_acme_attempt 2>/dev/null; then fail "failed-attempt cleanup ignored listing failure"; fi
+    [[ -f "$ACME_HOME/acme.sh" ]] || fail "ACME home was deleted after a failed listing"
+    assert_not_contains "$ACME_TEST_LOG" 'unexpected-uninstall'
+    cat >"$ACME_HOME/acme.sh" <<'EOF'
+#!/bin/sh
+case "$1" in
+    --list) printf 'Main_Domain KeyLength SAN_Domains CA Created Renew\n' ;;
+    --uninstall) exit 1 ;;
+esac
+EOF
+    if cleanup_owned_acme_client 2>/dev/null; then fail "failed ACME uninstall returned success"; fi
+    [[ -f "$ACME_HOME/acme.sh" ]] || fail "ACME account was removed after uninstall failed"
+)
 
 transaction_root="$TEST_ROOT/transaction"
 CONFIG_DIR="$transaction_root/etc/hysteria"
@@ -332,11 +421,126 @@ cp() {
 }
 printf 'after-config\n' >"$CONFIG_FILE"
 if rollback_transaction; then fail "incomplete rollback was reported as successful"; fi
+assert_contains "$CONFIG_FILE" 'after-config'
 [[ -d "$FAILED_SNAPSHOT" ]] || fail "failed rollback deleted its recovery snapshot"
 [[ "$TRANSACTION_ACTIVE" == "0" ]] || fail "failed rollback remained active"
 unset -f cp
 safe_remove_tree "$FAILED_SNAPSHOT"
 TRANSACTION_DIR=""
+
+# Validate every record before changing any live path.
+begin_transaction || fail "manifest-corruption snapshot failed"
+FAILED_SNAPSHOT="$TRANSACTION_DIR"
+sed -i '/^config_dir=/d' "$TRANSACTION_DIR/manifest"
+printf 'keep-live-config\n' >"$CONFIG_FILE"
+printf 'keep-live-client\n' >"$CLIENT_DIR/client.txt"
+if rollback_transaction; then fail "missing snapshot record was accepted"; fi
+assert_contains "$CONFIG_FILE" 'keep-live-config'
+assert_contains "$CLIENT_DIR/client.txt" 'keep-live-client'
+[[ -d "$FAILED_SNAPSHOT" ]] || fail "corrupt snapshot was discarded"
+safe_remove_tree "$FAILED_SNAPSHOT"
+TRANSACTION_DIR=""
+(
+    printf() {
+        if [[ "$1" == '%s=1\n' || "$1" == '%s=0\n' ]]; then return 1; fi
+        builtin printf "$@"
+    }
+    if begin_transaction; then fail "manifest write failure was ignored"; fi
+    assert_contains "$CONFIG_FILE" 'keep-live-config'
+    [[ -z "$TRANSACTION_DIR" && "$TRANSACTION_ACTIVE" == 0 ]] || fail "failed snapshot was not cleaned"
+)
+signal_snapshot="$(mktemp -d /tmp/hy2-transaction.XXXXXX)"
+printf 'snapshot-secret\n' >"$signal_snapshot/partial"
+if (
+    TRANSACTION_DIR="$signal_snapshot"
+    TRANSACTION_SNAPSHOTTING=1
+    on_signal
+) 2>/dev/null; then fail "signal handler returned success"; fi
+[[ ! -d "$signal_snapshot" ]] || fail "interrupted snapshot was left behind"
+
+(
+    begin_transaction || fail "rename-failure snapshot failed"
+    printf 'keep-on-rename-failure\n' >"$CONFIG_FILE"
+    mv() {
+        if [[ "${3:-}" == "${CONFIG_DIR}.restore.$$" ]]; then return 1; fi
+        command mv "$@"
+    }
+    if rollback_transaction; then fail "failed replacement returned success"; fi
+    assert_contains "$CONFIG_FILE" 'keep-on-rename-failure'
+    [[ -d "$TRANSACTION_DIR" ]] || fail "failed replacement discarded its snapshot"
+    safe_remove_tree "$TRANSACTION_DIR"
+)
+
+# A crontab filtering error must not overwrite unrelated jobs.
+(
+    mkdir -p "$HY2_TEST_ROOT/etc"
+    cron_file="$HY2_TEST_ROOT/etc/crontab"
+    printf '%s\n' 'unrelated-cron-job' '0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1' >"$cron_file"
+    grep() { if [[ "$1" == -Fvx ]]; then return 2; fi; command grep "$@"; }
+    if remove_legacy_crontab_entry; then fail "crontab read error returned success"; fi
+    assert_contains "$cron_file" 'unrelated-cron-job'
+    unset -f grep
+    remove_legacy_crontab_entry
+    assert_contains "$cron_file" 'unrelated-cron-job'
+    assert_not_contains "$cron_file" 'acme.sh --cron'
+)
+(
+    empty_dir="$TEST_ROOT/empty-directory"
+    mkdir -p "$empty_dir"
+    rmdir() { return 1; }
+    if remove_empty_directory "$empty_dir"; then fail "empty-directory deletion failure was ignored"; fi
+    printf 'keep\n' >"$empty_dir/unowned.txt"
+    remove_empty_directory "$empty_dir" || fail "non-owned file was treated as a deletion error"
+    assert_contains "$empty_dir/unowned.txt" keep
+)
+
+# Restart loops fail health checks even when both samples report active.
+(
+    restart_marker="$TEST_ROOT/restart-sample"
+    systemctl() {
+        if [[ "$1" == show ]]; then
+            if [[ -f "$restart_marker" ]]; then printf '1\n'; else touch "$restart_marker"; printf '0\n'; fi
+        else return 0; fi
+    }
+    sleep() { return 0; }
+    if check_service_health; then fail "health check accepted a restarted service"; fi
+    systemctl() { if [[ "$1" == show ]]; then printf '0\n'; else return 0; fi; }
+    check_service_health || fail "healthy service was rejected"
+)
+
+# A late uninstall failure retains state and permits retry without config.yaml.
+(
+    require_root() { return 0; }
+    cleanup_legacy_artifacts() { return 0; }
+    remove_acme_assets() { return 0; }
+    systemctl() { return 0; }
+    PUBLIC_IP=203.0.113.10; SERVER_ADDRESS="$PUBLIC_IP"; SERVER_PORT=24443
+    AUTH_PASSWORD=uninstall-auth; OBFS_PASSWORD=uninstall-obfs
+    CERT_MODE=selfsigned; TLS_SNI="$PUBLIC_IP"; TLS_INSECURE=1; TLS_PIN_SHA256=example-pin
+    ACME_CHALLENGE_PORT=""; ACME_OWNED=0; ACME_CERT_OWNED=0
+    HYSTERIA_CORE_OWNED=1; HYSTERIA_USER_OWNED=0; UNINSTALL_PENDING=0
+    save_installer_state
+    rm() {
+        if [[ "${2:-}" == "$MANAGEMENT_BIN" ]]; then return 1; fi
+        command rm "$@"
+    }
+    if uninstall_hysteria <<<'UNINSTALL'; then fail "failed uninstall returned success"; fi
+    [[ -f "$STATE_FILE" && -f "$MANAGEMENT_BIN" ]] || fail "retry state or management command was deleted"
+    [[ ! -e "$CONFIG_FILE" ]] || fail "uninstall failure was not exercised after config removal"
+    assert_eq "$(state_get uninstall_pending)" 1
+    if read_current_config 2>/dev/null; then fail "pending uninstall was treated as a usable install"; fi
+    if quick_install 0 2>/dev/null; then fail "pending uninstall was overwritten by installation"; fi
+    unset -f rm
+    uninstall_hysteria <<<'UNINSTALL' || fail "partial uninstall could not be resumed"
+    [[ ! -e "$STATE_FILE" && ! -e "$MANAGEMENT_BIN" ]] || fail "completed uninstall left retry files"
+)
+
+# Installing an older local copy must not overwrite the management command.
+mkdir -p "$CONFIG_DIR" "$(dirname "$MANAGEMENT_BIN")" "$(dirname "$HYSTERIA_BIN")"
+printf 'readonly SCRIPT_VERSION="99.0.0"\n' >"$MANAGEMENT_BIN"
+if install_management_command 2>/dev/null; then fail "management command downgrade was accepted"; fi
+assert_contains "$MANAGEMENT_BIN" '99.0.0'
+rm -f "$MANAGEMENT_BIN"
 
 cat >"$HYSTERIA_BIN" <<'EOF'
 #!/bin/sh

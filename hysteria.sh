@@ -4,26 +4,27 @@
 set -o pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.0.7"
+readonly SCRIPT_VERSION="2.0.8"
 readonly CORE_INSTALLER_URL="https://get.hy2.sh/"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh"
 readonly MIN_SAFE_CORE_VERSION="2.9.2"
+readonly MIN_ACME_VERSION="3.1.4"
 
 if [[ "${HY2_TEST_MODE:-0}" == "1" ]]; then
-    CONFIG_DIR="${HY2_CONFIG_DIR:-/etc/hysteria}"
+    CONFIG_DIR="${HY2_CONFIG_DIR:-${HY2_TEST_ROOT:-}/etc/hysteria}"
     CONFIG_FILE="${HY2_CONFIG_FILE:-${CONFIG_DIR}/config.yaml}"
     STATE_FILE="${HY2_STATE_FILE:-${CONFIG_DIR}/installer-state.conf}"
     CERT_FILE="${HY2_CERT_FILE:-${CONFIG_DIR}/server.crt}"
     KEY_FILE="${HY2_KEY_FILE:-${CONFIG_DIR}/server.key}"
-    CLIENT_DIR="${HY2_CLIENT_DIR:-/root/hy}"
+    CLIENT_DIR="${HY2_CLIENT_DIR:-${HY2_TEST_ROOT:-}/root/hy}"
     BACKUP_DIR="${HY2_BACKUP_DIR:-${CONFIG_DIR}/backups}"
-    HYSTERIA_BIN="${HY2_BIN:-/usr/local/bin/hysteria}"
-    MANAGEMENT_BIN="${HY2_MANAGEMENT_BIN:-/usr/bin/hy2}"
+    HYSTERIA_BIN="${HY2_BIN:-${HY2_TEST_ROOT:-}/usr/local/bin/hysteria}"
+    MANAGEMENT_BIN="${HY2_MANAGEMENT_BIN:-${HY2_TEST_ROOT:-}/usr/bin/hy2}"
     SERVICE_NAME="${HY2_SERVICE_NAME:-hysteria-server.service}"
-    SERVICE_FILE="${HY2_SERVICE_FILE:-/etc/systemd/system/hysteria-server.service}"
-    SERVICE_TEMPLATE_FILE="${HY2_SERVICE_TEMPLATE_FILE:-/etc/systemd/system/hysteria-server@.service}"
-    ACME_HOME="${HY2_ACME_HOME:-/root/.acme.sh}"
-    HYSTERIA_HOME_DIR="${HY2_HYSTERIA_HOME_DIR:-/var/lib/hysteria}"
+    SERVICE_FILE="${HY2_SERVICE_FILE:-${HY2_TEST_ROOT:-}/etc/systemd/system/hysteria-server.service}"
+    SERVICE_TEMPLATE_FILE="${HY2_SERVICE_TEMPLATE_FILE:-${HY2_TEST_ROOT:-}/etc/systemd/system/hysteria-server@.service}"
+    ACME_HOME="${HY2_ACME_HOME:-${HY2_TEST_ROOT:-}/root/.acme.sh}"
+    HYSTERIA_HOME_DIR="${HY2_HYSTERIA_HOME_DIR:-${HY2_TEST_ROOT:-}/var/lib/hysteria}"
 else
     CONFIG_DIR="/etc/hysteria"; CONFIG_FILE="/etc/hysteria/config.yaml"
     STATE_FILE="/etc/hysteria/installer-state.conf"
@@ -51,10 +52,14 @@ ACME_OWNED="0"
 ACME_CERT_OWNED="0"
 HYSTERIA_USER_OWNED="0"
 HYSTERIA_CORE_OWNED="0"
+UNINSTALL_PENDING="0"
 FAILED_ACME_IDENTIFIER=""
 FAILED_ACME_CERT_OWNED="0"
 TRANSACTION_DIR=""
 TRANSACTION_ACTIVE="0"
+TRANSACTION_SNAPSHOTTING="0"
+TEMP_FILES=()
+TEMP_DIRS=()
 
 if [[ -t 1 ]]; then
     C_RED='\033[31m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_BLUE='\033[36m'; C_RESET='\033[0m'
@@ -87,10 +92,24 @@ version_at_least() {
 
 is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
 has_valid_installer_state() {
-    [[ -f "$STATE_FILE" && -n "$(state_get_from "$STATE_FILE" version 2>/dev/null || true)" ]]
+    local version
+    version="$(state_get version 2>/dev/null)" || return 1
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+test_paths_are_safe() {
+    local root="${HY2_TEST_ROOT:-}" path resolved
+    [[ "$root" == /tmp/hy2-tests.* && -d "$root" && ! -L "$root" ]] || return 1
+    [[ "$(readlink -m -- "$root")" == "$root" ]] || return 1
+    for path in "$CONFIG_DIR" "$CONFIG_FILE" "$STATE_FILE" "$CERT_FILE" "$KEY_FILE" \
+        "$CLIENT_DIR" "$BACKUP_DIR" "$HYSTERIA_BIN" "$MANAGEMENT_BIN" "$SERVICE_FILE" \
+        "$SERVICE_TEMPLATE_FILE" "$ACME_HOME" "$HYSTERIA_HOME_DIR"; do
+        resolved="$(readlink -m -- "$path")" || return 1
+        [[ "$resolved" == "$root"/* && "$resolved" == "$path" && ! -L "$path" ]] || return 1
+    done
 }
 managed_paths_are_safe() {
     local path resolved
+    if [[ "${HY2_TEST_MODE:-0}" == "1" ]]; then test_paths_are_safe || return 1; fi
     for path in "$CONFIG_DIR" "$CLIENT_DIR" "$BACKUP_DIR"; do
         [[ ! -L "$path" ]] || return 1
         resolved="$(readlink -m -- "$path" 2>/dev/null)" || return 1
@@ -106,7 +125,14 @@ is_safe_tree_path() {
         "$CONFIG_DIR"|"$CLIENT_DIR"|"$BACKUP_DIR"|"$ACME_HOME"|"$HYSTERIA_HOME_DIR"|/tmp/hy2-transaction.*|/tmp/hy2-certcheck.*) ;;
         *) return 1 ;;
     esac
+    if [[ "${HY2_TEST_MODE:-0}" == "1" ]]; then
+        case "$target" in
+            /tmp/hy2-transaction.*|/tmp/hy2-certcheck.*) ;;
+            *) test_paths_are_safe || return 1 ;;
+        esac
+    fi
     resolved="$(readlink -m -- "$target" 2>/dev/null)" || return 1
+    [[ "$resolved" == "$target" && ! -L "$target" ]] || return 1
     [[ -n "$resolved" && ${#resolved} -ge 6 ]] || return 1
     case "$resolved" in /|/root|/etc|/usr|/var|/tmp) return 1 ;; esac
 }
@@ -137,6 +163,7 @@ valid_ipv4() {
     local ip="$1" part
     local -a parts=()
     local IFS='.'
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
     read -r -a parts <<<"$ip"
     [[ ${#parts[@]} -eq 4 ]] || return 1
     for part in "${parts[@]}"; do
@@ -180,7 +207,7 @@ valid_hostname() {
     local name="$1"
     [[ ${#name} -le 253 && "$name" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
 }
-valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
+valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
 valid_secret() {
     [[ -n "$1" && ${#1} -le 256 ]] || return 1
     ! printf '%s' "$1" | LC_ALL=C grep -q '[[:cntrl:]]'
@@ -224,8 +251,9 @@ yaml_unquote() {
 }
 
 uri_encode() {
-    local input="$1" out="" byte char
+    local input="$1" out="" byte char hex
     local -a bytes=()
+    hex="$(printf '%s' "$input" | od -An -v -tx1)" || return 1
     while read -r -a bytes; do
         for byte in "${bytes[@]}"; do
             case "$byte" in
@@ -236,7 +264,8 @@ uri_encode() {
                 *) out+="%${byte^^}" ;;
             esac
         done
-    done < <(printf '%s' "$input" | od -An -v -tx1)
+    done <<<"$hex"
+    [[ -z "$input" || -n "$out" ]] || return 1
     printf '%s' "$out"
 }
 
@@ -247,7 +276,7 @@ host_for_uri() {
 state_get_from() {
     local file="$1" key="$2"
     [[ -f "$file" ]] || return 1
-    awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$file"
+    awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; found=1; exit} END {if (!found) exit 1}' "$file"
 }
 state_get() { state_get_from "$STATE_FILE" "$1"; }
 atomic_install_file() {
@@ -263,7 +292,7 @@ require_root() {
 }
 
 detect_os() {
-    [[ -r /etc/os-release ]] || die "无法识别系统，仅支持使用 systemd 的主流 Linux 发行版。"
+    [[ -r /etc/os-release ]] || { die "无法识别系统，仅支持使用 systemd 的主流 Linux 发行版。"; return 1; }
     # shellcheck disable=SC1091
     . /etc/os-release
     case "${ID:-}" in
@@ -273,7 +302,7 @@ detect_os() {
             case "${ID_LIKE:-}" in
                 *debian*) PACKAGE_FAMILY="apt" ;;
                 *rhel*|*fedora*) PACKAGE_FAMILY="rpm" ;;
-                *) die "暂不支持此系统：${PRETTY_NAME:-unknown}" ;;
+                *) die "暂不支持此系统：${PRETTY_NAME:-unknown}"; return 1 ;;
             esac
             ;;
     esac
@@ -282,7 +311,7 @@ detect_os() {
 
 install_dependencies() {
     local missing=() cmd
-    for cmd in curl openssl awk sed grep ss socat; do
+    for cmd in curl openssl awk sed grep ss socat od tr head sort readlink; do
         has_cmd "$cmd" || missing+=("$cmd")
     done
     ((${#missing[@]} == 0)) && return 0
@@ -290,10 +319,10 @@ install_dependencies() {
     if [[ "$PACKAGE_FAMILY" == "apt" ]]; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -y || return 1
-        apt-get install -y curl ca-certificates openssl iproute2 gawk sed grep socat || return 1
+        apt-get install -y curl ca-certificates openssl iproute2 gawk sed grep socat coreutils || return 1
     else
         local manager="dnf"; has_cmd dnf || manager="yum"
-        "$manager" install -y curl ca-certificates openssl iproute gawk sed grep socat || return 1
+        "$manager" install -y curl ca-certificates openssl iproute gawk sed grep socat coreutils || return 1
     fi
 }
 
@@ -338,6 +367,7 @@ download_checked_script() {
 install_hysteria_core() {
     local installer installed_version
     installer="$(mktemp /tmp/hy2-core-installer.XXXXXX)" || return 1
+    TEMP_FILES+=("$installer")
     if ! download_checked_script "$CORE_INSTALLER_URL" "$installer"; then
         rm -f "$installer"
         return 1
@@ -345,8 +375,8 @@ install_hysteria_core() {
     info "安装 Hysteria 2 官方内核"
     bash "$installer" || { rm -f "$installer"; return 1; }
     rm -f "$installer"
-    [[ -x "$HYSTERIA_BIN" ]] || die "官方安装完成，但未找到内核：$HYSTERIA_BIN"
-    installed_version="$(hysteria_core_version)" || die "无法识别新安装的 Hysteria 内核版本。"
+    [[ -x "$HYSTERIA_BIN" ]] || { die "官方安装完成，但未找到内核：$HYSTERIA_BIN"; return 1; }
+    installed_version="$(hysteria_core_version)" || { die "无法识别新安装的 Hysteria 内核版本。"; return 1; }
     version_at_least "$installed_version" "$MIN_SAFE_CORE_VERSION" || die "新安装的 Hysteria 内核低于安全下限 v${MIN_SAFE_CORE_VERSION}。"
 }
 
@@ -404,12 +434,15 @@ secure_files() {
 }
 
 remove_legacy_crontab_entry() {
-    local crontab_file="/etc/crontab" temp exact mode owner group
+    local crontab_file="/etc/crontab" temp exact mode owner group status=0
+    if [[ "${HY2_TEST_MODE:-0}" == "1" ]]; then crontab_file="$HY2_TEST_ROOT/etc/crontab"; fi
     [[ -f "$crontab_file" ]] || return 0
     exact="0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1"
     grep -Fqx "$exact" "$crontab_file" || return 0
     temp="$(mktemp /tmp/hy2-crontab.XXXXXX)" || return 1
-    grep -Fvx "$exact" "$crontab_file" >"$temp" || true
+    TEMP_FILES+=("$temp")
+    grep -Fvx "$exact" "$crontab_file" >"$temp" || status=$?
+    ((status <= 1)) || { rm -f "$temp"; error "读取系统 crontab 失败，已保留原文件。"; return 1; }
     mode="$(stat -c %a "$crontab_file")" || { rm -f "$temp"; return 1; }
     owner="$(stat -c %u "$crontab_file")" || { rm -f "$temp"; return 1; }
     group="$(stat -c %g "$crontab_file")" || { rm -f "$temp"; return 1; }
@@ -419,30 +452,36 @@ remove_legacy_crontab_entry() {
 }
 
 cleanup_legacy_artifacts() {
-    remove_legacy_crontab_entry || true
-    rm -f /usr/local/bin/hy2-fix-cert-perms \
-        /etc/letsencrypt/renewal-hooks/deploy/hy2-fix-cert-perms
+    local prefix=""
+    if [[ "${HY2_TEST_MODE:-0}" == "1" ]]; then prefix="$HY2_TEST_ROOT"; fi
+    remove_legacy_crontab_entry || return 1
+    rm -f "$prefix/usr/local/bin/hy2-fix-cert-perms" \
+        "$prefix/etc/letsencrypt/renewal-hooks/deploy/hy2-fix-cert-perms"
 }
 
 snapshot_path() {
     local label="$1" path="$2"
     if [[ -e "$path" || -L "$path" ]]; then
-        printf '%s=1\n' "$label" >>"$TRANSACTION_DIR/manifest"
         cp -a -- "$path" "$TRANSACTION_DIR/$label" || return 1
+        printf '%s=1\n' "$label" >>"$TRANSACTION_DIR/manifest" || return 1
     else
-        printf '%s=0\n' "$label" >>"$TRANSACTION_DIR/manifest"
+        printf '%s=0\n' "$label" >>"$TRANSACTION_DIR/manifest" || return 1
     fi
 }
 
 abort_transaction_snapshot() {
     if [[ "$TRANSACTION_DIR" == /tmp/hy2-transaction.* ]]; then safe_remove_tree "$TRANSACTION_DIR" || true; fi
-    TRANSACTION_DIR=""; TRANSACTION_ACTIVE="0"
+    TRANSACTION_DIR=""; TRANSACTION_ACTIVE="0"; TRANSACTION_SNAPSHOTTING="0"
 }
 
 begin_transaction() {
     [[ "$TRANSACTION_ACTIVE" == "0" ]] || return 1
-    TRANSACTION_DIR="$(mktemp -d /tmp/hy2-transaction.XXXXXX)" || return 1
-    : >"$TRANSACTION_DIR/manifest"
+    managed_paths_are_safe || return 1
+    # A retained failed-rollback snapshot must not be overwritten by a new operation.
+    [[ -z "$TRANSACTION_DIR" ]] || { error "请先处理保留的快照：$TRANSACTION_DIR"; return 1; }
+    TRANSACTION_SNAPSHOTTING="1"
+    TRANSACTION_DIR="$(mktemp -d /tmp/hy2-transaction.XXXXXX)" || { TRANSACTION_SNAPSHOTTING="0"; return 1; }
+    : >"$TRANSACTION_DIR/manifest" || { abort_transaction_snapshot; return 1; }
     snapshot_path config_dir "$CONFIG_DIR" || { abort_transaction_snapshot; return 1; }
     snapshot_path client_dir "$CLIENT_DIR" || { abort_transaction_snapshot; return 1; }
     snapshot_path service_file "$SERVICE_FILE" || { abort_transaction_snapshot; return 1; }
@@ -451,29 +490,75 @@ begin_transaction() {
     snapshot_path hysteria_bin "$HYSTERIA_BIN" || { abort_transaction_snapshot; return 1; }
     snapshot_path acme_home "$ACME_HOME" || { abort_transaction_snapshot; return 1; }
     snapshot_path hysteria_home_dir "$HYSTERIA_HOME_DIR" || { abort_transaction_snapshot; return 1; }
-    if id hysteria >/dev/null 2>&1; then printf 'hysteria_user=1\n' >>"$TRANSACTION_DIR/manifest"; else printf 'hysteria_user=0\n' >>"$TRANSACTION_DIR/manifest"; fi
-    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then printf 'service_active=1\n' >>"$TRANSACTION_DIR/manifest"; else printf 'service_active=0\n' >>"$TRANSACTION_DIR/manifest"; fi
-    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then printf 'service_enabled=1\n' >>"$TRANSACTION_DIR/manifest"; else printf 'service_enabled=0\n' >>"$TRANSACTION_DIR/manifest"; fi
+    local user=0 active=0 enabled=0
+    id hysteria >/dev/null 2>&1 && user=1
+    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && active=1
+    systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null && enabled=1
+    printf 'hysteria_user=%s\nservice_active=%s\nservice_enabled=%s\n' "$user" "$active" "$enabled" \
+        >>"$TRANSACTION_DIR/manifest" || { abort_transaction_snapshot; return 1; }
     TRANSACTION_ACTIVE="1"
+    TRANSACTION_SNAPSHOTTING="0"
+}
+
+snapshot_record_is_valid() {
+    local label="$1" existed
+    existed="$(state_get_from "$TRANSACTION_DIR/manifest" "$label")" || return 1
+    case "$existed" in
+        1) [[ -e "$TRANSACTION_DIR/$label" || -L "$TRANSACTION_DIR/$label" ]] ;;
+        0) [[ ! -e "$TRANSACTION_DIR/$label" && ! -L "$TRANSACTION_DIR/$label" ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+transaction_snapshot_is_valid() {
+    local label value
+    for label in config_dir client_dir service_file service_template_file management_bin hysteria_bin acme_home hysteria_home_dir; do
+        snapshot_record_is_valid "$label" || return 1
+    done
+    for label in hysteria_user service_active service_enabled; do
+        value="$(state_get_from "$TRANSACTION_DIR/manifest" "$label")" || return 1
+        [[ "$value" == 0 || "$value" == 1 ]] || return 1
+    done
 }
 
 restore_snapshot_path() {
-    local label="$1" path="$2" existed
-    existed="$(state_get_from "$TRANSACTION_DIR/manifest" "$label" 2>/dev/null || printf '0')"
-    if [[ -d "$path" && ! -L "$path" ]]; then
+    local label="$1" path="$2" existed staged="${2}.restore.$$" old="${2}.previous.$$"
+    snapshot_record_is_valid "$label" || { error "快照记录不完整，已保留现有路径：$path"; return 1; }
+    existed="$(state_get_from "$TRANSACTION_DIR/manifest" "$label")" || return 1
+    if [[ "$existed" == "1" ]]; then
+        [[ ! -e "$staged" && ! -L "$staged" && ! -e "$old" && ! -L "$old" ]] || return 1
+        mkdir -p "$(dirname "$path")" || return 1
+        if ! cp -a -- "$TRANSACTION_DIR/$label" "$staged"; then
+            rm -rf -- "$staged"
+            return 1
+        fi
+        if [[ -e "$path" || -L "$path" ]]; then
+            mv -T -- "$path" "$old" || { rm -rf -- "$staged"; return 1; }
+        fi
+        if ! mv -T -- "$staged" "$path"; then
+            if [[ -e "$old" || -L "$old" ]]; then
+                mv -T -- "$old" "$path" || error "旧文件保留在：$old"
+            fi
+            rm -rf -- "$staged"
+            return 1
+        fi
+        # Only these two exact sibling paths were created by this restore.
+        rm -rf -- "$old" || return 1
+    elif [[ -d "$path" && ! -L "$path" ]]; then
         safe_remove_tree "$path" || return 1
     else
         rm -f -- "$path" || return 1
-    fi
-    if [[ "$existed" == "1" ]]; then
-        mkdir -p "$(dirname "$path")" || return 1
-        cp -a -- "$TRANSACTION_DIR/$label" "$path" || return 1
     fi
 }
 
 rollback_transaction() {
     local rollback_failed=0 snapshot_dir="$TRANSACTION_DIR"
     [[ "$TRANSACTION_ACTIVE" == "1" ]] || return 0
+    if ! transaction_snapshot_is_valid; then
+        TRANSACTION_ACTIVE="0"
+        error "快照不完整，已停止自动回滚并保留现有文件。请检查：$snapshot_dir"
+        return 1
+    fi
     warn "操作失败，正在恢复修改前状态。"
     systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
     restore_snapshot_path config_dir "$CONFIG_DIR" || rollback_failed=1
@@ -525,9 +610,21 @@ commit_transaction() {
     TRANSACTION_DIR=""
 }
 
+cleanup_temp_files() {
+    local path
+    for path in "${TEMP_FILES[@]}"; do rm -f -- "$path" || true; done
+    for path in "${TEMP_DIRS[@]}"; do safe_remove_tree "$path" || true; done
+}
+
 on_signal() {
+    trap '' INT TERM
     printf '\n' >&2
-    rollback_transaction
+    if [[ "$TRANSACTION_ACTIVE" == "1" ]]; then
+        rollback_transaction
+    elif [[ "$TRANSACTION_SNAPSHOTTING" == "1" ]]; then
+        abort_transaction_snapshot
+    fi
+    cleanup_temp_files
     error "操作已中止。"
     exit 130
 }
@@ -593,13 +690,27 @@ install_acme_client() {
     [[ -x "$ACME_HOME/acme.sh" ]] && return 0
     [[ -d "$ACME_HOME" ]] && existed=1
     installer="$(mktemp /tmp/hy2-acme-installer.XXXXXX)" || return 1
-    curl -fL --retry 3 --connect-timeout 10 --max-time 120 https://get.acme.sh -o "$installer" || { rm -f "$installer"; return 1; }
-    grep -q 'acme.sh' "$installer" || { rm -f "$installer"; error "ACME 安装器内容异常。"; return 1; }
+    TEMP_FILES+=("$installer")
+    curl -fL --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 10 --max-time 120 https://get.acme.sh -o "$installer" || { rm -f "$installer"; return 1; }
+    if [[ "$(head -n 1 "$installer")" != '#!'* ]] || ! sh -n "$installer" || ! grep -q 'acme.sh' "$installer"; then
+        rm -f "$installer"; error "ACME 安装器内容或语法异常。"; return 1
+    fi
     sh "$installer" --no-profile || { rm -f "$installer"; return 1; }
     rm -f "$installer"
     [[ -x "$ACME_HOME/acme.sh" ]] || return 1
     [[ "$existed" == "0" ]] && ACME_OWNED="1"
     return 0
+}
+
+check_acme_version() {
+    local output version
+    output="$("$ACME_HOME/acme.sh" --version 2>/dev/null)" || output=""
+    if [[ "$output" =~ v?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+        version="${BASH_REMATCH[1]}"
+        version_at_least "$version" "$MIN_ACME_VERSION" && return 0
+    fi
+    error "可信 IP 证书需要 acme.sh v${MIN_ACME_VERSION}+。请自行更新已有客户端后重试；脚本不会自动升级它。"
+    return 1
 }
 
 certificate_pin() {
@@ -652,6 +763,7 @@ issue_acme_certificate() {
     FAILED_ACME_CERT_OWNED="0"
     ensure_cron_available || return 1
     install_acme_client || return 1
+    if [[ "$mode" == "ip-acme" ]]; then check_acme_version || return 1; fi
     acme_has_certificate "$identifier" && order_preexisting=1
     if [[ -f "$STATE_FILE" && -x "$ACME_HOME/acme.sh" ]] &&
         [[ "$(state_get cert_mode 2>/dev/null || true)" == "$mode" ]] &&
@@ -676,7 +788,6 @@ issue_acme_certificate() {
     else
         info "申请 Let's Encrypt 域名证书（标识：$identifier）"
     fi
-    "${acme[@]}" --set-default-ca --server letsencrypt >/dev/null || return 1
     [[ "$order_preexisting" == "1" ]] || FAILED_ACME_CERT_OWNED="1"
     local issue_args=(--issue "${challenge_args[@]}" -d "$identifier" --server letsencrypt --keylength ec-256)
     [[ "$mode" == "ip-acme" ]] && issue_args+=(--certificate-profile shortlived --days -3)
@@ -746,35 +857,41 @@ remove_acme_order_if_owned() {
     }
 }
 
+cleanup_owned_acme_client() {
+    local listing remaining
+    [[ "$ACME_OWNED" == "1" && -x "$ACME_HOME/acme.sh" ]] || return 0
+    listing="$("$ACME_HOME/acme.sh" --list 2>/dev/null)" || {
+        warn "无法查询 ACME 证书列表，已保留客户端、账号和续期任务。"; return 1
+    }
+    # A successful but empty/invalid response also cannot prove there are no certificates.
+    [[ "$listing" == Main_Domain* ]] || { warn "ACME 证书列表格式异常，已保留客户端。"; return 1; }
+    remaining="$(awk 'NR > 1 && NF {count++} END {print count+0}' <<<"$listing")" || return 1
+    if [[ "$remaining" != "0" ]]; then
+        warn "acme.sh 中仍有其他证书，已保留 ACME 客户端与续期任务。"
+        return 0
+    fi
+    "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1 || { warn "ACME 客户端卸载失败，已保留账号文件。"; return 1; }
+    safe_remove_tree "$ACME_HOME" || return 1
+    ACME_OWNED="0"
+}
+
 cleanup_previous_acme_certificate() {
-    local previous_mode="$1" previous_identifier="$2" previous_owned="$3" remaining
+    local previous_mode="$1" previous_identifier="$2" previous_owned="$3"
     [[ "$previous_mode" == "ip-acme" || "$previous_mode" == "domain-acme" ]] || return 0
     [[ -n "$previous_identifier" ]] || return 0
     if [[ "$previous_mode" == "$CERT_MODE" && "$previous_identifier" == "$TLS_SNI" ]]; then return 0; fi
     if [[ "$previous_identifier" == "$FAILED_ACME_IDENTIFIER" && "$previous_owned" != "1" ]]; then return 0; fi
-    if remove_acme_order_if_owned "$previous_identifier" "$previous_owned" && [[ "$previous_identifier" == "$FAILED_ACME_IDENTIFIER" ]]; then
-        FAILED_ACME_CERT_OWNED="0"
-    fi
-    if [[ -x "$ACME_HOME/acme.sh" && "$CERT_MODE" != "ip-acme" && "$CERT_MODE" != "domain-acme" && "$ACME_OWNED" == "1" ]]; then
-        remaining="$("$ACME_HOME/acme.sh" --list 2>/dev/null | awk 'NR > 1 && NF {count++} END {print count+0}')"
-        if [[ "$remaining" == "0" ]]; then
-            "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1 || true
-            [[ -d "$ACME_HOME" ]] && safe_remove_tree "$ACME_HOME" || true
-            ACME_OWNED="0"
-        fi
+    remove_acme_order_if_owned "$previous_identifier" "$previous_owned" || return 1
+    if [[ "$previous_identifier" == "$FAILED_ACME_IDENTIFIER" ]]; then FAILED_ACME_CERT_OWNED="0"; fi
+    if [[ "$CERT_MODE" != "ip-acme" && "$CERT_MODE" != "domain-acme" ]]; then
+        cleanup_owned_acme_client || return 1
     fi
 }
 
 cleanup_failed_acme_attempt() {
-    local remaining
-    remove_acme_order_if_owned "$FAILED_ACME_IDENTIFIER" "$FAILED_ACME_CERT_OWNED" || true
-    if [[ -x "$ACME_HOME/acme.sh" && "$CERT_MODE" != "ip-acme" && "$CERT_MODE" != "domain-acme" && "$ACME_OWNED" == "1" ]]; then
-        remaining="$("$ACME_HOME/acme.sh" --list 2>/dev/null | awk 'NR > 1 && NF {count++} END {print count+0}')"
-        if [[ "$remaining" == "0" ]]; then
-            "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1 || true
-            [[ -d "$ACME_HOME" ]] && safe_remove_tree "$ACME_HOME" || true
-            ACME_OWNED="0"
-        fi
+    remove_acme_order_if_owned "$FAILED_ACME_IDENTIFIER" "$FAILED_ACME_CERT_OWNED" || return 1
+    if [[ "$CERT_MODE" != "ip-acme" && "$CERT_MODE" != "domain-acme" ]]; then
+        cleanup_owned_acme_client || return 1
     fi
     FAILED_ACME_IDENTIFIER=""
     FAILED_ACME_CERT_OWNED="0"
@@ -798,6 +915,7 @@ save_installer_state() {
         printf 'acme_cert_owned=%s\n' "$ACME_CERT_OWNED"
         printf 'hysteria_user_owned=%s\n' "$HYSTERIA_USER_OWNED"
         printf 'hysteria_core_owned=%s\n' "$HYSTERIA_CORE_OWNED"
+        printf 'uninstall_pending=%s\n' "$UNINSTALL_PENDING"
     } >"$temp" || return 1
     chmod 600 "$temp" || return 1
     mv -f "$temp" "$STATE_FILE"
@@ -847,13 +965,49 @@ activate_server_config() {
     mv -f "$new_config" "$CONFIG_FILE" || return 1
     secure_files || return 1
     systemctl restart "$SERVICE_NAME" || return 1
-    sleep 2
-    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+    if ! check_service_health; then
         error "Hysteria 服务启动失败，最近日志如下："
         journalctl -u "$SERVICE_NAME" -n 20 --no-pager >&2 || true
         return 1
     fi
     rotate_backups
+}
+
+check_service_health() {
+    local before after
+    before="$(systemctl show "$SERVICE_NAME" -p NRestarts --value)" || return 1
+    [[ "$before" =~ ^[0-9]+$ ]] || return 1
+    sleep 2
+    systemctl is-active --quiet "$SERVICE_NAME" || return 1
+    sleep 5
+    systemctl is-active --quiet "$SERVICE_NAME" || return 1
+    after="$(systemctl show "$SERVICE_NAME" -p NRestarts --value)" || return 1
+    [[ "$before" == "$after" ]]
+}
+
+server_ip_candidates() {
+    local resolved=""
+    if ! valid_ip "$SERVER_ADDRESS" && has_cmd getent; then
+        resolved="$(getent ahosts "$SERVER_ADDRESS" 2>/dev/null | awk '{print $1}' || true)"
+    fi
+    printf '%s\n' "$SERVER_ADDRESS" "$PUBLIC_IP" "$resolved"
+}
+
+client_tun_excludes_server() {
+    local file="$CLIENT_DIR/hy-client-tun.yaml" candidate key cidr found=0
+    [[ -f "$file" ]] || return 1
+    while IFS= read -r candidate; do
+        if valid_ipv4 "$candidate"; then key=ipv4Exclude; cidr="$candidate/32"
+        elif valid_ipv6 "$candidate"; then key=ipv6Exclude; cidr="$candidate/128"
+        else continue; fi
+        found=1
+        awk -v key="$key" -v cidr="$cidr" '
+            /^    [[:alnum:]]+:/ {inside=($0 ~ "^    " key ":")}
+            inside && /^      - / {value=$0; sub(/^      - /, "", value); gsub(/"/, "", value); if (value == cidr) found=1}
+            END {exit !found}
+        ' "$file" || return 1
+    done < <(server_ip_candidates)
+    ((found == 1))
 }
 
 client_server_value() {
@@ -877,7 +1031,13 @@ write_client_tls_block() {
 }
 
 generate_client_configs() {
-    local server_value socks_file tun_file url_file uri_host uri_port query uri candidate resolved seen="|" ipv4_yaml="" ipv6_yaml=""
+    local server_value socks_file tun_file url_file uri_host uri_port query uri candidate seen="|" ipv4_yaml="" ipv6_yaml=""
+    local encoded_auth encoded_sni encoded_obfs encoded_pin
+    managed_paths_are_safe || return 1
+    encoded_auth="$(uri_encode "$AUTH_PASSWORD")" || return 1
+    encoded_sni="$(uri_encode "$TLS_SNI")" || return 1
+    encoded_obfs="$(uri_encode "$OBFS_PASSWORD")" || return 1
+    encoded_pin="$(uri_encode "$TLS_PIN_SHA256")" || return 1
     mkdir -p "$CLIENT_DIR" || return 1
     server_value="$(client_server_value)"
     socks_file="$CLIENT_DIR/hy-client.yaml"
@@ -906,9 +1066,6 @@ EOF
         printf 'obfs:\n  type: salamander\n  salamander:\n    password: %s\n' "$(yaml_quote "$OBFS_PASSWORD")"
     } >"$tun_file" || return 1
     write_client_tls_block "$tun_file" || return 1
-    if ! valid_ip "$SERVER_ADDRESS" && has_cmd getent; then
-        resolved="$(getent ahosts "$SERVER_ADDRESS" 2>/dev/null | awk '{print $1}' || true)"
-    fi
     while IFS= read -r candidate; do
         [[ -n "$candidate" && "$seen" != *"|${candidate}|"* ]] || continue
         if valid_ipv4 "$candidate"; then
@@ -916,7 +1073,7 @@ EOF
         elif valid_ipv6 "$candidate"; then
             ipv6_yaml+="      - \"${candidate}/128\""$'\n'; seen+="${candidate}|"
         fi
-    done <<<"${PUBLIC_IP}"$'\n'"${resolved:-}"
+    done < <(server_ip_candidates)
     cat >>"$tun_file" <<EOF || return 1
 tun:
   name: hy2
@@ -937,10 +1094,10 @@ EOF
 
     uri_host="$(host_for_uri "$SERVER_ADDRESS")"
     uri_port="$SERVER_PORT"
-    query="sni=$(uri_encode "$TLS_SNI")&obfs=salamander&obfs-password=$(uri_encode "$OBFS_PASSWORD")"
+    query="sni=${encoded_sni}&obfs=salamander&obfs-password=${encoded_obfs}"
     [[ "$TLS_INSECURE" == "1" ]] && query+="&insecure=1"
-    [[ -n "$TLS_PIN_SHA256" ]] && query+="&pinSHA256=$(uri_encode "$TLS_PIN_SHA256")"
-    uri="hysteria2://$(uri_encode "$AUTH_PASSWORD")@${uri_host}:${uri_port}/?${query}#hy2"
+    [[ -n "$TLS_PIN_SHA256" ]] && query+="&pinSHA256=${encoded_pin}"
+    uri="hysteria2://${encoded_auth}@${uri_host}:${uri_port}/?${query}#hy2"
     printf '%s\n' "$uri" >"$url_file" || return 1
     chmod 600 "$socks_file" "$tun_file" "$url_file"
 }
@@ -970,6 +1127,7 @@ certificate_is_self_signed() {
 certificate_is_system_trusted() {
     local cert="$1" temp count i result=1
     temp="$(mktemp -d /tmp/hy2-certcheck.XXXXXX)" || return 1
+    TEMP_DIRS+=("$temp")
     if ! awk -v prefix="$temp/part-" '
         /-----BEGIN CERTIFICATE-----/ {part++}
         part > 0 {print > (prefix part ".pem")}
@@ -997,20 +1155,8 @@ read_current_config() {
     ACME_CERT_OWNED="0"
     if [[ -f "$STATE_FILE" ]]; then
         has_state=1
-        SERVER_ADDRESS="$(state_get server_address 2>/dev/null || true)"
-        PUBLIC_IP="$(state_get public_ip 2>/dev/null || true)"
-        SERVER_PORT="$(state_get server_port 2>/dev/null || printf '443')"
-        AUTH_PASSWORD="$(state_get auth_password 2>/dev/null || true)"
-        OBFS_PASSWORD="$(state_get obfs_password 2>/dev/null || true)"
-        CERT_MODE="$(state_get cert_mode 2>/dev/null || printf 'selfsigned')"
-        TLS_SNI="$(state_get tls_sni 2>/dev/null || true)"
-        TLS_INSECURE="$(state_get tls_insecure 2>/dev/null || printf '1')"
-        TLS_PIN_SHA256="$(state_get tls_pin_sha256 2>/dev/null || true)"
-        ACME_CHALLENGE_PORT="$(state_get acme_challenge_port 2>/dev/null || true)"
-        ACME_OWNED="$(state_get acme_owned 2>/dev/null || printf '0')"
-        ACME_CERT_OWNED="$(state_get acme_cert_owned 2>/dev/null || printf '0')"
-        HYSTERIA_USER_OWNED="$(state_get hysteria_user_owned 2>/dev/null || printf '0')"
-        HYSTERIA_CORE_OWNED="$(state_get hysteria_core_owned 2>/dev/null || printf '0')"
+        load_installer_state || return 1
+        [[ "$UNINSTALL_PENDING" == "0" ]] || { error "上次卸载未完成，请运行 hy2 --uninstall 继续。"; return 1; }
     fi
     [[ -f "$CONFIG_FILE" ]] || return 1
     if [[ "$has_state" == "0" ]]; then
@@ -1057,17 +1203,68 @@ read_current_config() {
     [[ "$TLS_INSECURE" != "1" || -n "$TLS_PIN_SHA256" ]]
 }
 
+load_resource_ownership() {
+    local value
+    ACME_OWNED="$(state_get acme_owned 2>/dev/null || printf '0')"
+    ACME_CERT_OWNED="$(state_get acme_cert_owned 2>/dev/null || printf '0')"
+    HYSTERIA_USER_OWNED="$(state_get hysteria_user_owned 2>/dev/null || printf '0')"
+    HYSTERIA_CORE_OWNED="$(state_get hysteria_core_owned 2>/dev/null || printf '0')"
+    UNINSTALL_PENDING="$(state_get uninstall_pending 2>/dev/null || printf '0')"
+    for value in "$ACME_OWNED" "$ACME_CERT_OWNED" "$HYSTERIA_USER_OWNED" "$HYSTERIA_CORE_OWNED" "$UNINSTALL_PENDING"; do
+        [[ "$value" == "0" || "$value" == "1" ]] || { error "安装状态中的所有权记录无效，已停止操作。"; return 1; }
+    done
+}
+
+load_installer_state() {
+    has_valid_installer_state || return 1
+    SERVER_ADDRESS="$(state_get server_address)" || return 1
+    PUBLIC_IP="$(state_get public_ip)" || return 1
+    SERVER_PORT="$(state_get server_port)" || return 1
+    AUTH_PASSWORD="$(state_get auth_password)" || return 1
+    OBFS_PASSWORD="$(state_get obfs_password)" || return 1
+    CERT_MODE="$(state_get cert_mode)" || return 1
+    TLS_SNI="$(state_get tls_sni)" || return 1
+    TLS_INSECURE="$(state_get tls_insecure)" || return 1
+    TLS_PIN_SHA256="$(state_get tls_pin_sha256 2>/dev/null || true)"
+    ACME_CHALLENGE_PORT="$(state_get acme_challenge_port 2>/dev/null || true)"
+    load_resource_ownership || return 1
+    valid_ip "$PUBLIC_IP" && valid_port "$SERVER_PORT" || return 1
+    valid_ip "$SERVER_ADDRESS" || valid_hostname "$SERVER_ADDRESS" || return 1
+    valid_ip "$TLS_SNI" || valid_hostname "$TLS_SNI" || return 1
+    valid_secret "$AUTH_PASSWORD" && valid_secret "$OBFS_PASSWORD" || return 1
+    [[ -z "$ACME_CHALLENGE_PORT" || "$ACME_CHALLENGE_PORT" == "80" || "$ACME_CHALLENGE_PORT" == "443" ]] || return 1
+    case "$CERT_MODE:$TLS_INSECURE" in
+        selfsigned:1) [[ -n "$TLS_PIN_SHA256" ]] ;;
+        ip-acme:0|domain-acme:0|existing:0) [[ -z "$TLS_PIN_SHA256" ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+installation_is_not_pending_uninstall() {
+    [[ "$(state_get uninstall_pending 2>/dev/null || printf '0')" == "0" ]] || {
+        error "上次卸载未完成，请运行 hy2 --uninstall 继续。"; return 1
+    }
+}
+
 install_management_command() {
-    local source_path target_path
-    source_path="$(readlink -f "${BASH_SOURCE[0]}")"
+    local source_path target_path installed_version
+    source_path="$(readlink -f "${BASH_SOURCE[0]:-}")" || return 1
+    [[ -f "$source_path" ]] || { error "请先将安装脚本保存为文件，再运行。"; return 1; }
     target_path="$(readlink -f "$MANAGEMENT_BIN" 2>/dev/null || printf '%s' "$MANAGEMENT_BIN")"
     [[ "$source_path" == "$target_path" ]] && return 0
+    if [[ -f "$MANAGEMENT_BIN" ]]; then
+        installed_version="$(sed -nE 's/^readonly SCRIPT_VERSION="([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' "$MANAGEMENT_BIN")"
+        if [[ -n "$installed_version" ]] && ! version_at_least "$SCRIPT_VERSION" "$installed_version"; then
+            error "当前脚本 v${SCRIPT_VERSION} 旧于管理命令 v${installed_version}，已拒绝降级。"; return 1
+        fi
+    fi
     atomic_install_file "$source_path" "$MANAGEMENT_BIN" 755 root root
 }
 
 update_script() (
     local candidate remote_version
     require_root || return 1
+    installation_is_not_pending_uninstall || return 1
     managed_paths_are_safe || { error "托管路径检查失败，已拒绝更新管理脚本。"; return 1; }
     if ! has_valid_installer_state || [[ ! -f "$CONFIG_FILE" || ! -f "$MANAGEMENT_BIN" || -L "$MANAGEMENT_BIN" ]]; then
         error "未找到本脚本的有效安装或管理命令路径异常，请先使用下载的脚本安装。"
@@ -1124,6 +1321,7 @@ prepare_runtime() {
 ensure_install_scope_safe() {
     local -a conflicts=()
     managed_paths_are_safe || { error "检测到托管路径为符号链接或指向预期目录之外，已拒绝继续。"; return 1; }
+    installation_is_not_pending_uninstall || return 1
     has_valid_installer_state && return 0
     if [[ -d "$CONFIG_DIR" ]] && find "$CONFIG_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .; then conflicts+=("$CONFIG_DIR"); fi
     if [[ -d "$CLIENT_DIR" ]] && find "$CLIENT_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .; then conflicts+=("$CLIENT_DIR"); fi
@@ -1157,12 +1355,13 @@ install_core_and_unit() {
 perform_install() {
     local cert_strategy="$1" source_cert="${2:-}" source_key="${3:-}" previous_cert_mode="" previous_sni="" previous_acme_cert_owned="0"
     if [[ -f "$STATE_FILE" ]]; then
+        # Validate in a subshell so the user's new settings are not overwritten.
+        (load_installer_state) || { error "安装状态不完整或字段无效，已停止修改。"; return 1; }
         previous_cert_mode="$(state_get cert_mode 2>/dev/null || true)"
         previous_sni="$(state_get tls_sni 2>/dev/null || true)"
-        ACME_OWNED="$(state_get acme_owned 2>/dev/null || printf '0')"
+        load_resource_ownership || return 1
+        installation_is_not_pending_uninstall || return 1
         previous_acme_cert_owned="$(state_get acme_cert_owned 2>/dev/null || printf '0')"
-        HYSTERIA_USER_OWNED="$(state_get hysteria_user_owned 2>/dev/null || printf '0')"
-        HYSTERIA_CORE_OWNED="$(state_get hysteria_core_owned 2>/dev/null || printf '0')"
     fi
     begin_transaction || return 1
     if ! install_core_and_unit; then rollback_transaction; return 1; fi
@@ -1199,9 +1398,9 @@ perform_install() {
     if ! generate_client_configs || ! install_management_command; then rollback_transaction; return 1; fi
     if ! secure_files; then rollback_transaction; return 1; fi
     commit_transaction || warn "请按上方路径人工删除旧配置快照。"
-    cleanup_legacy_artifacts
-    cleanup_previous_acme_certificate "$previous_cert_mode" "$previous_sni" "$previous_acme_cert_owned"
-    cleanup_failed_acme_attempt
+    cleanup_legacy_artifacts || warn "旧版辅助文件未能完整清理。"
+    cleanup_previous_acme_certificate "$previous_cert_mode" "$previous_sni" "$previous_acme_cert_owned" || warn "旧 ACME 资源已保留。"
+    cleanup_failed_acme_attempt || warn "未能完整清理失败的 ACME 申请，相关资源已保留。"
     save_installer_state || warn "配置已生效，但安装器状态文件未能更新。"
     print_client_result
 }
@@ -1209,6 +1408,8 @@ perform_install() {
 quick_install() {
     local allow_reinstall="${1:-0}"
     require_root || return 1
+    managed_paths_are_safe || return 1
+    installation_is_not_pending_uninstall || return 1
     if has_valid_installer_state && [[ -f "$CONFIG_FILE" && "$allow_reinstall" != "1" ]]; then
         install_management_command || return 1
         info "已有安装：配置保持不变，管理命令使用当前脚本 v${SCRIPT_VERSION}。从 GitHub 更新请运行 hy2 --update-script。"
@@ -1229,13 +1430,13 @@ quick_install() {
 
 prompt_value() {
     local prompt="$1" default="$2" answer
-    read -r -p "$prompt [$default]: " answer
+    read -r -p "$prompt [$default]: " answer || { error "输入已结束，操作已取消。"; return 1; }
     printf '%s' "${answer:-$default}"
 }
 
 prompt_port_settings() {
     while true; do
-        SERVER_PORT="$(prompt_value "UDP 端口" "${SERVER_PORT:-443}")"
+        SERVER_PORT="$(prompt_value "UDP 端口" "${SERVER_PORT:-443}")" || return 1
         valid_port "$SERVER_PORT" && return 0
         warn "端口必须是 1-65535。"
     done
@@ -1246,21 +1447,21 @@ prompt_certificate_strategy() {
     CERT_STRATEGY=""; CERT_SOURCE_FILE=""; KEY_SOURCE_FILE=""
     while true; do
         printf '\n证书方式：\n  1) 可信公网 IP 证书（推荐，无需域名）\n  2) 域名 ACME 证书\n  3) 使用现有系统可信证书\n  4) 自签名 + 指纹校验\n'
-        read -r -p "请选择 [1]: " choice
+        read -r -p "请选择 [1]: " choice || return 1
         choice="${choice:-1}"
         case "$choice" in
             1) TLS_SNI="$PUBLIC_IP"; CERT_STRATEGY="ip-acme"; return 0 ;;
             2)
-                read -r -p "已解析到本机公网 IP 的域名: " domain
+                read -r -p "已解析到本机公网 IP 的域名: " domain || return 1
                 if valid_hostname "$domain"; then
                     SERVER_ADDRESS="$domain"; TLS_SNI="$domain"; CERT_STRATEGY="domain-acme"; return 0
                 fi
                 warn "域名格式无效。"
                 ;;
             3)
-                read -r -p "完整证书链路径: " cert
-                read -r -p "私钥路径: " key
-                read -r -p "证书中的域名或 IP [$SERVER_ADDRESS]: " domain
+                read -r -p "完整证书链路径: " cert || return 1
+                read -r -p "私钥路径: " key || return 1
+                read -r -p "证书中的域名或 IP [$SERVER_ADDRESS]: " domain || return 1
                 TLS_SNI="${domain:-$SERVER_ADDRESS}"
                 CERT_STRATEGY="existing"; CERT_SOURCE_FILE="$cert"; KEY_SOURCE_FILE="$key"; return 0
                 ;;
@@ -1274,13 +1475,13 @@ custom_install() {
     prepare_runtime || return 1
     ensure_install_scope_safe || return 1
     read_current_config >/dev/null 2>&1 || true
-    SERVER_ADDRESS="$(prompt_value "客户端连接地址" "${SERVER_ADDRESS:-$PUBLIC_IP}")"
+    SERVER_ADDRESS="$(prompt_value "客户端连接地址" "${SERVER_ADDRESS:-$PUBLIC_IP}")" || return 1
     if ! valid_ip "$SERVER_ADDRESS" && ! valid_hostname "$SERVER_ADDRESS"; then
         error "连接地址既不是有效 IP，也不是有效域名。"; return 1
     fi
     prompt_port_settings || return 1
-    AUTH_PASSWORD="$(prompt_value "认证密码（Enter 自动生成）" "${AUTH_PASSWORD:-$(random_secret 32)}")"
-    OBFS_PASSWORD="$(prompt_value "混淆密码（Enter 自动生成）" "${OBFS_PASSWORD:-$(random_secret 32)}")"
+    AUTH_PASSWORD="$(prompt_value "认证密码（Enter 自动生成）" "${AUTH_PASSWORD:-$(random_secret 32)}")" || return 1
+    OBFS_PASSWORD="$(prompt_value "混淆密码（Enter 自动生成）" "${OBFS_PASSWORD:-$(random_secret 32)}")" || return 1
     valid_secret "$AUTH_PASSWORD" && valid_secret "$OBFS_PASSWORD" || { error "密码必须为 1-256 个字符，且不能包含控制字符。"; return 1; }
     prompt_certificate_strategy || return 1
     perform_install "$CERT_STRATEGY" "$CERT_SOURCE_FILE" "$KEY_SOURCE_FILE"
@@ -1379,8 +1580,8 @@ diagnose() {
             printf '[WARN] 导入证书将在 30 天内到期\n'
         fi
     fi
-    if [[ -f "$CLIENT_DIR/hy-client-tun.yaml" ]] && grep -qF "$PUBLIC_IP/" "$CLIENT_DIR/hy-client-tun.yaml"; then
-        printf '[OK] TUN 配置已排除服务器公网 IP，避免代理回环\n'
+    if client_tun_excludes_server; then
+        printf '[OK] TUN 配置已排除服务器连接 IP，避免代理回环\n'
     else
         printf '[WARN] TUN 配置未发现服务器 IP 排除项，请重新生成客户端配置\n'
     fi
@@ -1391,7 +1592,7 @@ diagnose() {
 service_menu() {
     local choice
     printf '\n1) 启动  2) 停止  3) 重启  4) 状态  5) 实时日志  0) 返回\n'
-    read -r -p "请选择: " choice
+    read -r -p "请选择: " choice || return 0
     case "$choice" in
         1) systemctl start "$SERVICE_NAME" && success "服务已启动。" ;;
         2) systemctl stop "$SERVICE_NAME" && success "服务已停止。" ;;
@@ -1412,45 +1613,45 @@ update_core() {
     if ! install_hysteria_core || ! ensure_service_unit || ! systemctl restart "$SERVICE_NAME"; then
         rollback_transaction; return 1
     fi
-    sleep 2
-    if ! systemctl is-active --quiet "$SERVICE_NAME"; then rollback_transaction; return 1; fi
+    if ! check_service_health; then rollback_transaction; return 1; fi
     commit_transaction || warn "请按上方路径人工删除旧内核快照。"
     success "内核已更新，服务运行正常。"
 }
 
 remove_acme_assets() {
-    local identifier="$1" remaining
+    local identifier="$1"
     [[ -x "$ACME_HOME/acme.sh" ]] || return 0
     if [[ "$CERT_MODE" == "ip-acme" || "$CERT_MODE" == "domain-acme" ]]; then
         if [[ "$ACME_CERT_OWNED" == "1" ]]; then
-            remove_acme_order_if_owned "$identifier" "$ACME_CERT_OWNED" || true
+            remove_acme_order_if_owned "$identifier" "$ACME_CERT_OWNED" || return 1
         else
             warn "当前 ACME 证书订单不是本脚本创建的，已保留：$identifier"
         fi
     fi
-    [[ "$ACME_OWNED" == "1" ]] || return 0
-    remaining="$("$ACME_HOME/acme.sh" --list 2>/dev/null | awk 'NR > 1 && NF {count++} END {print count+0}')"
-    if [[ "$remaining" == "0" ]]; then
-        "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1 || true
-        [[ -d "$ACME_HOME" ]] && safe_remove_tree "$ACME_HOME" || true
-    else
-        warn "acme.sh 中仍有其他证书，已保留 ACME 客户端与续期任务。"
-    fi
+    cleanup_owned_acme_client
 }
 
 remove_managed_data_files() {
-    rm -f "$CONFIG_FILE" "$STATE_FILE" "$CERT_FILE" "$KEY_FILE"
+    rm -f "$CONFIG_FILE" "$CERT_FILE" "$KEY_FILE" || return 1
     if [[ -d "$BACKUP_DIR" ]]; then
         find "$BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.yaml' -delete || return 1
-        if ! rmdir "$BACKUP_DIR" 2>/dev/null; then warn "备份目录中存在非本脚本文件，已保留：$BACKUP_DIR"; fi
+        remove_empty_directory "$BACKUP_DIR" || return 1
     fi
-    if [[ -d "$CONFIG_DIR" ]] && ! rmdir "$CONFIG_DIR" 2>/dev/null; then
-        warn "配置目录中存在非本脚本文件，已保留：$CONFIG_DIR"
+    rm -f "$CLIENT_DIR/url.txt" "$CLIENT_DIR/hy-client.yaml" "$CLIENT_DIR/hy-client-tun.yaml" "$CLIENT_DIR/hy-client.json" || return 1
+    remove_empty_directory "$CLIENT_DIR"
+}
+
+remove_empty_directory() {
+    local path="$1" remaining
+    [[ -d "$path" ]] || return 0
+    rmdir "$path" 2>/dev/null && return 0
+    remaining="$(find "$path" -mindepth 1 -maxdepth 1 -print -quit)" || return 1
+    if [[ -n "$remaining" ]]; then
+        warn "目录中仍有其他文件，已保留：$path"
+        return 0
     fi
-    rm -f "$CLIENT_DIR/url.txt" "$CLIENT_DIR/hy-client.yaml" "$CLIENT_DIR/hy-client-tun.yaml" "$CLIENT_DIR/hy-client.json"
-    if [[ -d "$CLIENT_DIR" ]] && ! rmdir "$CLIENT_DIR" 2>/dev/null; then
-        warn "客户端目录中存在非本脚本文件，已保留：$CLIENT_DIR"
-    fi
+    error "无法删除空目录：$path"
+    return 1
 }
 
 uninstall_hysteria() {
@@ -1458,28 +1659,42 @@ uninstall_hysteria() {
     require_root || return 1
     managed_paths_are_safe || { error "检测到托管路径为符号链接或指向预期目录之外，已拒绝卸载。"; return 1; }
     has_valid_installer_state || { error "未找到本脚本的有效安装状态，拒绝删除可能由其他方式创建的 Hysteria。"; return 1; }
-    read_current_config >/dev/null 2>&1 || true
+    load_installer_state || { error "安装状态不完整或字段无效，已停止卸载。"; return 1; }
     printf '将删除本脚本管理的服务、配置、客户端文件和内核；不会修改任何防火墙规则。\n'
-    read -r -p "请输入 UNINSTALL 确认: " confirmation
+    read -r -p "请输入 UNINSTALL 确认: " confirmation || { warn "输入已结束，已取消。"; return 0; }
     [[ "$confirmation" == "UNINSTALL" ]] || { warn "已取消。"; return 0; }
 
-    systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-    cleanup_legacy_artifacts
-    remove_acme_assets "$TLS_SNI"
-    rm -f "$SERVICE_FILE" "$MANAGEMENT_BIN"
+    UNINSTALL_PENDING="1"
+    save_installer_state || { error "无法保存卸载状态，已停止操作。"; return 1; }
+    if [[ -f "$SERVICE_FILE" ]]; then
+        systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || { error "无法停止并禁用服务，已停止卸载。"; return 1; }
+    elif systemctl is-active --quiet "$SERVICE_NAME"; then
+        systemctl stop "$SERVICE_NAME" || return 1
+    fi
+    cleanup_legacy_artifacts || { error "旧版辅助文件清理失败；可重新运行 --uninstall。"; return 1; }
+    remove_acme_assets "$TLS_SNI" || { error "ACME 清理失败，相关文件与安装状态已保留；可重新运行 --uninstall。"; return 1; }
+    rm -f "$SERVICE_FILE" || return 1
     if [[ "$HYSTERIA_CORE_OWNED" == "1" ]]; then
-        rm -f "$SERVICE_TEMPLATE_FILE" "$HYSTERIA_BIN"
+        rm -f "$SERVICE_TEMPLATE_FILE" "$HYSTERIA_BIN" || return 1
     else
         warn "Hysteria 内核在首次安装前已存在，已保留内核与官方模板服务。"
     fi
-    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
     remove_managed_data_files || return 1
     if [[ "$HYSTERIA_USER_OWNED" == "1" ]]; then
         if id hysteria >/dev/null 2>&1 && ! userdel hysteria >/dev/null 2>&1; then
-            warn "hysteria 用户仍被占用，未删除其主目录。"
+            error "hysteria 用户仍被占用，未删除其主目录；请处理后重新运行 --uninstall。"
+            return 1
         elif [[ -d "$HYSTERIA_HOME_DIR" ]]; then
-            safe_remove_tree "$HYSTERIA_HOME_DIR" || true
+            safe_remove_tree "$HYSTERIA_HOME_DIR" || return 1
         fi
+    fi
+    rm -f "$MANAGEMENT_BIN" || { error "管理命令删除失败，安装状态已保留。"; return 1; }
+    rm -f "$STATE_FILE" || { error "状态文件删除失败，请重新下载脚本运行 --uninstall 完成清理。"; return 1; }
+    if ! remove_empty_directory "$CONFIG_DIR"; then
+        # Keep ownership records available if final directory removal failed.
+        save_installer_state || error "无法恢复安装状态，请人工检查：$CONFIG_DIR"
+        return 1
     fi
     success "卸载完成。未修改任何防火墙规则，也不会删除其他 ACME 证书。"
 }
@@ -1506,7 +1721,7 @@ main_menu() {
   9) 从 GitHub 更新管理脚本
   0) 退出
 EOF
-        read -r -p "请选择 [${default_choice}]: " choice
+        read -r -p "请选择 [${default_choice}]: " choice || return 0
         choice="${choice:-$default_choice}"
         case "$choice" in
             1)
@@ -1560,6 +1775,14 @@ main() {
     esac
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${HY2_TEST_MODE:-0}" == "1" ]] && ! test_paths_are_safe; then
+    error "测试模式需要 HY2_TEST_ROOT 指向 /tmp/hy2-tests.* 临时目录，所有托管路径必须位于该目录内。"
+    return 1 2>/dev/null || exit 1
+fi
+
+if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
+    error "不支持通过管道或标准输入运行安装脚本。请先下载为 hysteria.sh，再运行 sudo bash hysteria.sh --install。"
+    exit 2
+elif [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     main "$@"
 fi

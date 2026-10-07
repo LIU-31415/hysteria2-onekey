@@ -34,6 +34,11 @@ $required = @(
     'acme_has_certificate',
     'HY2_TEST_MODE',
     'MIN_SAFE_CORE_VERSION="2.9.2"',
+    'MIN_ACME_VERSION="3.1.4"',
+    'HY2_TEST_ROOT',
+    'transaction_snapshot_is_valid',
+    'check_service_health',
+    'uninstall_pending',
     'acme_cert_owned',
     'hysteria_core_owned',
     'ensure_install_scope_safe',
@@ -70,6 +75,7 @@ $forbidden = @(
     'mport=',
     "sed '/--cron/d' /etc/crontab",
     'curl -fsSL https://get.hy2.sh/ | bash'
+    '--set-default-ca'
 )
 foreach ($text in $forbidden) {
     Assert-True (-not $content.Contains($text)) "发现不安全或过时实现：$text"
