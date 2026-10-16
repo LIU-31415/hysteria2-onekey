@@ -4,7 +4,7 @@
 set -o pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.0.8"
+readonly SCRIPT_VERSION="2.0.9"
 readonly CORE_INSTALLER_URL="https://get.hy2.sh/"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh"
 readonly MIN_SAFE_CORE_VERSION="2.9.2"
@@ -1340,10 +1340,10 @@ install_core_and_unit() {
     if [[ -x "$HYSTERIA_BIN" ]] && current_version="$(hysteria_core_version)"; then
         if ! version_at_least "$current_version" "$MIN_SAFE_CORE_VERSION"; then
             error "现有 Hysteria 内核 v${current_version} 低于安全下限 v${MIN_SAFE_CORE_VERSION}，已拒绝继续。"
-            error "已由本脚本管理的节点可用菜单 7 更新；外部内核请先自行更新或移走。"
+            error "已由本脚本管理的节点可用菜单 6 更新；外部内核请先自行更新或移走。"
             return 1
         fi
-        info "保留当前 Hysteria 内核 v${current_version}；如需升级请使用菜单 7。"
+        info "保留当前 Hysteria 内核 v${current_version}；如需升级请使用菜单 6。"
     else
         install_hysteria_core || return 1
         HYSTERIA_CORE_OWNED="1"
@@ -1502,6 +1502,22 @@ show_config() {
     printf '  原生 TUN：%s\n' "$CLIENT_DIR/hy-client-tun.yaml"
     [[ "$TLS_INSECURE" == "1" ]] && warn "自签名模式必须保留 pinSHA256，不能只开启 insecure。"
     return 0
+}
+
+config_menu() {
+    local choice
+    printf '\n1) 查看配置与分享链接  2) 重新生成客户端配置  0) 返回\n'
+    read -r -p "请选择 [1]: " choice || return 0
+    case "${choice:-1}" in
+        1) show_config ;;
+        2)
+            read_current_config || { error "尚未安装或配置不完整。"; return 1; }
+            generate_client_configs || { error "客户端配置生成失败。"; return 1; }
+            success "客户端配置已重新生成。"
+            ;;
+        0) return 0 ;;
+        *) warn "无效选项，请输入 0-2。" ;;
+    esac
 }
 
 diagnose() {
@@ -1708,41 +1724,29 @@ main_menu() {
     require_root || return 1
     while true; do
         print_header
-        if [[ -f "$CONFIG_FILE" ]]; then default_choice=3; else default_choice=1; fi
+        if [[ -f "$CONFIG_FILE" ]]; then default_choice=3; else default_choice=2; fi
         cat <<'EOF'
-  1) 一键安装（已安装时从 GitHub 更新管理脚本）
+  1) 更新脚本
   2) 自定义安装 / 修改
-  3) 查看配置与分享链接
-  4) 重新生成客户端配置
-  5) 服务管理
-  6) 一键诊断
-  7) 更新 Hysteria 内核
-  8) 安全卸载
-  9) 从 GitHub 更新管理脚本
+  3) 配置与分享
+  4) 服务管理
+  5) 本机诊断
+  6) 更新 Hysteria 内核
+  7) 安全卸载
   0) 退出
 EOF
         read -r -p "请选择 [${default_choice}]: " choice || return 0
         choice="${choice:-$default_choice}"
         case "$choice" in
-            1)
-                if has_valid_installer_state && [[ -f "$CONFIG_FILE" ]]; then
-                    if update_script; then return 0; fi
-                else
-                    quick_install || true
-                fi
-                ;;
+            1) if update_script; then return 0; fi ;;
             2) custom_install || true ;;
-            3) show_config || true ;;
-            4)
-                if read_current_config && generate_client_configs; then success "客户端配置已重新生成。"; else error "无法读取现有配置。"; fi
-                ;;
-            5) service_menu || true ;;
-            6) diagnose || true ;;
-            7) update_core || true ;;
-            8) uninstall_hysteria || true ;;
-            9) if update_script; then return 0; fi ;;
+            3) config_menu || true ;;
+            4) service_menu || true ;;
+            5) diagnose || true ;;
+            6) update_core || true ;;
+            7) uninstall_hysteria || true ;;
             0) return 0 ;;
-            *) warn "无效选项，请输入 0-9。" ;;
+            *) warn "无效选项，请输入 0-7。" ;;
         esac
         printf '\n'
     done

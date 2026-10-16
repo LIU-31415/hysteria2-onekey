@@ -113,6 +113,49 @@ if bash -s -- --version <"$(dirname "$0")/../hysteria.sh" >"$TEST_ROOT/stdin.log
 fi
 assert_contains "$TEST_ROOT/stdin.log" '请先下载为 hysteria.sh'
 
+# Menu actions must keep script updates separate from installation and core updates.
+(
+    require_root() { return 0; }
+    CONFIG_FILE="$TEST_ROOT/missing-config"
+    menu_log="$TEST_ROOT/menu-actions.log"
+    quick_install() { fail "script update triggered installation"; }
+    update_script() { printf 'script\n' >>"$menu_log"; }
+    main_menu <<<'1' >"$TEST_ROOT/menu.log"
+    assert_eq "$(cat "$menu_log")" script
+    assert_contains "$TEST_ROOT/menu.log" '1) 更新脚本'
+    assert_not_contains "$TEST_ROOT/menu.log" '8)'
+    assert_not_contains "$TEST_ROOT/menu.log" '9)'
+
+    update_script() { return 1; }
+    custom_install() { printf 'custom\n' >>"$menu_log"; }
+    show_config() { printf 'show\n' >>"$menu_log"; }
+    read_current_config() { return 0; }
+    generate_client_configs() { printf 'generate\n' >>"$menu_log"; }
+    service_menu() { printf 'service\n' >>"$menu_log"; }
+    diagnose() { printf 'diagnose\n' >>"$menu_log"; }
+    update_core() { printf 'core\n' >>"$menu_log"; }
+    uninstall_hysteria() { printf 'uninstall\n' >>"$menu_log"; }
+    : >"$menu_log"
+    main_menu <<< $'1\n2\n3\n1\n3\n2\n4\n5\n6\n7\n9\n0' >"$TEST_ROOT/menu.log" 2>&1
+    assert_eq "$(cat "$menu_log")" $'custom\nshow\ngenerate\nservice\ndiagnose\ncore\nuninstall'
+    assert_contains "$TEST_ROOT/menu.log" '无效选项，请输入 0-7。'
+
+    : >"$menu_log"
+    config_menu </dev/null >/dev/null
+    config_menu <<<'0' >/dev/null
+    assert_eq "$(cat "$menu_log")" ''
+    config_menu <<<'' >/dev/null
+    assert_eq "$(cat "$menu_log")" show
+    read_current_config() { return 1; }
+    : >"$menu_log"
+    if config_menu <<<'2' >/dev/null 2>&1; then fail "config read failure was ignored"; fi
+    assert_eq "$(cat "$menu_log")" ''
+    read_current_config() { return 0; }
+    generate_client_configs() { return 1; }
+    if config_menu <<<'2' >"$TEST_ROOT/config-menu.log" 2>&1; then fail "config generation failure was ignored"; fi
+    assert_not_contains "$TEST_ROOT/config-menu.log" '[完成]'
+)
+
 mkdir -p "$CONFIG_DIR" "$CLIENT_DIR"
 managed_paths_are_safe || fail "normal managed paths were rejected"
 PUBLIC_IP="203.0.113.10"
