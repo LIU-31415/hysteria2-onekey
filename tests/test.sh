@@ -308,8 +308,8 @@ assert_eq "$ACME_CERT_OWNED" "1"
 
 legacy_cert="$TEST_ROOT/legacy-cert.crt"
 legacy_key="$TEST_ROOT/legacy-key.pem"
-cp "$CERT_FILE" "$legacy_cert"
-cp "$KEY_FILE" "$legacy_key"
+env cp "$CERT_FILE" "$legacy_cert"
+env cp "$KEY_FILE" "$legacy_key"
 rm -f "$STATE_FILE"
 cat >"$CONFIG_FILE" <<EOF
 listen: :35555
@@ -596,6 +596,7 @@ assert_eq "$(hysteria_core_version)" "2.12.2"
 PREPARE_MARKER="$TEST_ROOT/prepare-called"
 require_root() { return 0; }
 has_valid_installer_state() { return 0; }
+install_management_command() { return 0; }
 prepare_runtime() { : >"$PREPARE_MARKER"; return 1; }
 mkdir -p "$CONFIG_DIR"
 : >"$CONFIG_FILE"
