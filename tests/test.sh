@@ -60,6 +60,79 @@ assert_eq() { [[ "$1" == "$2" ]] || fail "expected [$2], got [$1]"; }
 assert_contains() { grep -Fq -- "$2" "$1" || fail "$1 does not contain: $2"; }
 assert_not_contains() { ! grep -Fq -- "$2" "$1" || fail "$1 unexpectedly contains: $2"; }
 
+# The lock covers CLI/menu dispatch, survives competing processes, and releases on exit.
+if has_cmd flock; then
+    script_under_test="$(cd "$(dirname "$0")/.." && pwd)/hysteria.sh"
+    (
+        acquire_operation_lock || fail "first operation could not acquire its lock"
+        if bash -c 'source "$1"; require_root() { return 0; }; main --uninstall' bash "$script_under_test" >"$TEST_ROOT/lock.log" 2>&1; then
+            fail "a second operation entered while the lock was held"
+        fi
+        assert_contains "$TEST_ROOT/lock.log" '另一个 hy2 正在运行'
+        bash "$script_under_test" --version >/dev/null || fail "version lookup required the operation lock"
+    )
+    if bash -c 'source "$1"; acquire_operation_lock || exit 99; exit 7' bash "$script_under_test"; then
+        fail "lock-release fixture unexpectedly succeeded"
+    else
+        assert_eq "$?" 7
+    fi
+    (acquire_operation_lock) || fail "a terminated process left its lock held"
+else
+    printf 'SKIP: real flock checks require Linux.\n'
+fi
+
+# Port checks permit only the managed service, including when sockets share a port.
+(
+    SERVER_PORT=443
+    has_valid_installer_state() { return 1; }
+    ss() { return 0; }
+    check_udp_port_available || fail "an unused UDP port was rejected"
+    ss() { printf 'UNCONN 0 0 *:443 *:* users:(("panel",pid=99,fd=3))\n'; }
+    if check_udp_port_available 2>/dev/null; then fail "a panel UDP listener was accepted"; fi
+    has_valid_installer_state() { return 0; }
+    systemctl() { printf '42\n'; }
+    ss() { printf 'UNCONN 0 0 *:443 *:* users:(("hysteria",pid=42,fd=3))\n'; }
+    check_udp_port_available || fail "the managed service blocked its own update"
+    ss() { printf 'UNCONN 0 0 *:443 *:* users:(("hysteria",pid=42,fd=3),("panel",pid=99,fd=4))\n'; }
+    if check_udp_port_available 2>/dev/null; then fail "a shared foreign listener was accepted"; fi
+    ss() { printf 'UNCONN 0 0 *:443 *:*\n'; }
+    if check_udp_port_available 2>/dev/null; then fail "an unidentified UDP listener was accepted"; fi
+    ss() { return 1; }
+    if check_udp_port_available 2>/dev/null; then fail "a failed socket query was treated as a free port"; fi
+    check_udp_port_available() { return 1; }
+    begin_transaction() { fail "port conflict reached the transaction"; }
+    if perform_install selfsigned; then fail "port conflict reached installation"; fi
+)
+(
+    curl() {
+        if [[ "$1" == --noproxy && "$2" == '*' ]]; then printf '203.0.113.10\n'
+        else printf '198.51.100.99\n'; fi
+    }
+    fetch_public_ip || fail "direct public IP detection failed"
+    assert_eq "$PUBLIC_IP" 203.0.113.10
+)
+
+# Comments, unrelated ACME homes, and text mentioning a command are not renewal jobs.
+(
+    cron_input="$TEST_ROOT/cron-input"
+    crontab() { cat "$cron_input"; }
+    for entry in \
+        "# * * * * * $ACME_HOME/acme.sh --cron" \
+        "* * * * * /other/acme.sh --cron" \
+        "* * * * * $ACME_HOME/acme.sh --cron --home /other" \
+        "* * * * * $ACME_HOME/acme.sh --cron --cert-home /other" \
+        "* * * * * echo $ACME_HOME/acme.sh --cron"; do
+        printf '%s\n' "$entry" >"$cron_input"
+        if acme_cron_present; then fail "invalid renewal job accepted: $entry"; fi
+    done
+    printf '12 23 * * * "%s"/acme.sh --cron --home "%s" > /dev/null\n' "$ACME_HOME" "$ACME_HOME" >"$cron_input"
+    acme_cron_present || fail "the official quoted cron entry was rejected"
+    printf "@daily sh '%s/acme.sh' --cron\n" "$ACME_HOME" >"$cron_input"
+    acme_cron_present || fail "a shell-wrapped cron entry was rejected"
+    crontab() { return 1; }
+    if acme_cron_present; then fail "a failed cron query was accepted"; fi
+)
+
 valid_ipv4 203.0.113.10 || fail "valid IPv4 rejected"
 ! valid_ipv4 203.0.113.999 || fail "invalid IPv4 accepted"
 valid_ipv6 2001:db8::1 || fail "valid IPv6 rejected"
@@ -398,7 +471,6 @@ case "$1" in
 esac
 EOF
     if remove_acme_assets unused 2>/dev/null; then fail "failed ACME listing was treated as empty"; fi
-    if cleanup_previous_acme_certificate ip-acme old-ip 0 2>/dev/null; then fail "previous ACME cleanup ignored listing failure"; fi
     FAILED_ACME_IDENTIFIER=""; FAILED_ACME_CERT_OWNED=0
     if cleanup_failed_acme_attempt 2>/dev/null; then fail "failed-attempt cleanup ignored listing failure"; fi
     [[ -f "$ACME_HOME/acme.sh" ]] || fail "ACME home was deleted after a failed listing"
@@ -412,6 +484,126 @@ esac
 EOF
     if cleanup_owned_acme_client 2>/dev/null; then fail "failed ACME uninstall returned success"; fi
     [[ -f "$ACME_HOME/acme.sh" ]] || fail "ACME account was removed after uninstall failed"
+)
+
+# Existing webroot orders take precedence over stale installer state and busy ports.
+(
+    CONFIG_DIR="$TEST_ROOT/webroot-case/etc/hysteria"
+    STATE_FILE="$CONFIG_DIR/installer-state.conf"
+    CERT_FILE="$CONFIG_DIR/server.crt"; KEY_FILE="$CONFIG_DIR/server.key"
+    ACME_HOME="$TEST_ROOT/webroot-case/acme"
+    PUBLIC_IP=203.0.113.10; SERVER_ADDRESS="$PUBLIC_IP"; SERVER_PORT=24443
+    TLS_SNI="$PUBLIC_IP"; TLS_INSECURE=0; TLS_PIN_SHA256=""; CERT_MODE=ip-acme
+    AUTH_PASSWORD=webroot-auth; OBFS_PASSWORD=webroot-obfs
+    ACME_CHALLENGE_PORT=443; ACME_CHALLENGE_METHOD=""; ACME_WEBROOT=""
+    UNINSTALL_PENDING=0; ACME_OWNED=0; ACME_CERT_OWNED=0
+    root="$TEST_ROOT/web root"
+    mkdir -p "$CONFIG_DIR" "$ACME_HOME/$PUBLIC_IP"_ecc "$root"
+    # Git Bash cannot apply Unix directory modes; Linux exercises directory creation.
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) mkdir -p "$root/.well-known/acme-challenge" ;;
+    esac
+    order="$ACME_HOME/${PUBLIC_IP}_ecc/$PUBLIC_IP.conf"
+    cat >"$order" <<EOF
+Le_Webroot='$root'
+Le_RealKeyPath='$KEY_FILE'
+Le_RealFullChainPath='$CERT_FILE'
+Le_Certificate_Profile='shortlived'
+Le_ReloadCmd='external-deploy-hook'
+touch '$TEST_ROOT/config-was-executed'
+EOF
+    cp "$order" "$TEST_ROOT/order-before.conf"
+    save_installer_state
+    sed -i '/^acme_challenge_method=/d; /^acme_webroot=/d' "$STATE_FILE"
+    load_installer_state || fail "legacy state could not adopt webroot metadata"
+    assert_eq "$ACME_CHALLENGE_METHOD" webroot
+    assert_eq "$ACME_CHALLENGE_PORT" 80
+    assert_eq "$ACME_WEBROOT" "$root"
+    [[ ! -e "$TEST_ROOT/config-was-executed" ]] || fail "ACME config was executed"
+    save_installer_state
+    assert_eq "$(state_get acme_webroot)" "$root"
+    assert_eq "$(state_get acme_challenge_method)" webroot
+
+    export HY2_TEST_RENEWED="$TEST_ROOT/renewed-marker"
+    export HY2_TEST_ACME_LOG="$TEST_ROOT/webroot-acme.log"
+    cat >"$ACME_HOME/acme.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$HY2_TEST_ACME_LOG"
+case "$1" in
+    --version) printf 'v3.1.7\n' ;;
+    --renew|--issue) : >"$HY2_TEST_RENEWED" ;;
+    --install-cert) ;;
+    *) exit 1 ;;
+esac
+EOF
+    chmod 700 "$ACME_HOME/acme.sh"
+    ensure_cron_available() { return 0; }
+    ensure_acme_cron_job() { return 0; }
+    acme_has_certificate() { return 0; }
+    tcp_port_in_use() { return 0; }
+    certificate_is_system_trusted() { return 0; }
+    validate_certificate_pair() { [[ -f "$HY2_TEST_RENEWED" ]]; }
+    curl() {
+        local url="${!#}"
+        [[ "$url" == "http://$PUBLIC_IP/.well-known/acme-challenge/"* ]] || fail "incorrect HTTP probe URL"
+        cat "$ACME_WEBROOT/.well-known/acme-challenge/${url##*/}"
+    }
+
+    : >"$HY2_TEST_RENEWED"
+    issue_acme_certificate "$PUBLIC_IP" ip-acme || fail "valid webroot certificate was not reused"
+    assert_not_contains "$HY2_TEST_ACME_LOG" '--renew'
+    diagnose_acme_challenge >"$TEST_ROOT/webroot-diagnose.log" || fail "busy TCP ports broke webroot diagnosis"
+    assert_contains "$TEST_ROOT/webroot-diagnose.log" 'HTTP-01/webroot'
+    assert_not_contains "$TEST_ROOT/webroot-diagnose.log" '无法绑定'
+
+    rm -f "$HY2_TEST_RENEWED"
+    issue_acme_certificate "$PUBLIC_IP" ip-acme || fail "webroot renewal failed with both ports occupied"
+    assert_contains "$HY2_TEST_ACME_LOG" "--renew -d $PUBLIC_IP --ecc --force"
+    assert_not_contains "$HY2_TEST_ACME_LOG" '--issue'
+    assert_not_contains "$HY2_TEST_ACME_LOG" '--install-cert'
+    assert_eq "$(cat "$order")" "$(cat "$TEST_ROOT/order-before.conf")"
+    assert_eq "$SERVER_PORT" 24443
+    [[ -z "$(find "$root" -name 'hy2-check.*' -print -quit)" ]] || fail "HTTP probe was left behind"
+    acme_has_certificate() { return 1; }
+    issue_acme_certificate "$PUBLIC_IP" ip-acme || fail "order metadata was ignored after a list failure"
+    assert_eq "$ACME_CHALLENGE_METHOD" webroot
+    acme_has_certificate() { return 0; }
+
+    rm -f "$HY2_TEST_RENEWED"
+    : >"$HY2_TEST_ACME_LOG"
+    curl() { printf 'wrong-token\n'; }
+    generate_self_signed_certificate() { fail "existing webroot order fell back to a self-signed certificate"; }
+    if configure_quick_certificate 2>/dev/null; then fail "unreachable webroot was accepted"; fi
+    assert_eq "$ACME_CHALLENGE_METHOD" webroot
+    assert_eq "$CERT_MODE" ip-acme
+    assert_not_contains "$HY2_TEST_ACME_LOG" '--renew'
+    [[ -z "$(find "$root" -name 'hy2-check.*' -print -quit)" ]] || fail "failed HTTP probe was left behind"
+    curl() { return 22; }
+    if check_acme_webroot "$PUBLIC_IP" 2>/dev/null; then fail "HTTP error was accepted"; fi
+
+    sed "s|^Le_RealKeyPath=.*|Le_RealKeyPath='/external/xui.key'|" "$order" >"$order.new"
+    mv "$order.new" "$order"
+    if issue_acme_certificate "$PUBLIC_IP" ip-acme 2>/dev/null; then fail "external deployment paths were overwritten"; fi
+    assert_contains "$order" "Le_RealKeyPath='/external/xui.key'"
+    assert_not_contains "$HY2_TEST_ACME_LOG" '--renew'
+
+    printf "Le_Webroot='dns_cf'\n" >"$order"
+    if read_acme_challenge "$PUBLIC_IP" 2>/dev/null; then fail "unknown validation mode was replaced silently"; fi
+    rm -f "$order"
+    sed -i '/^acme_challenge_method=/d; /^acme_webroot=/d; s/^acme_challenge_port=.*/acme_challenge_port=443/' "$STATE_FILE"
+    load_installer_state || fail "old standalone state was rejected"
+    assert_eq "$ACME_CHALLENGE_METHOD" alpn
+
+    acme_has_certificate() { return 1; }
+    tcp_port_in_use() { [[ "$1" == 443 ]]; }
+    : >"$HY2_TEST_ACME_LOG"
+    if configure_quick_certificate 2>/dev/null; then fail "missing managed order was silently recreated"; fi
+    assert_not_contains "$HY2_TEST_ACME_LOG" '--issue'
+    rm -f "$STATE_FILE"
+    issue_acme_certificate "$PUBLIC_IP" ip-acme || fail "fresh standalone issuance regressed"
+    assert_contains "$HY2_TEST_ACME_LOG" '--issue --standalone'
+    assert_contains "$HY2_TEST_ACME_LOG" '--certificate-profile shortlived --days -3'
+    assert_contains "$HY2_TEST_ACME_LOG" "--reloadcmd systemctl try-restart $SERVICE_NAME"
 )
 
 transaction_root="$TEST_ROOT/transaction"
@@ -453,6 +645,46 @@ assert_contains "$SERVICE_FILE" 'before-service'
 assert_contains "$MOCK_LOG" "systemctl enable $SERVICE_NAME"
 assert_contains "$MOCK_LOG" "systemctl start $SERVICE_NAME"
 [[ "$TRANSACTION_ACTIVE" == "0" ]] || fail "transaction remained active after rollback"
+
+# Rollback restores only the selected order, preserving other renewals and webroots.
+(
+    mkdir -p "$ACME_HOME/203.0.113.10_ecc" "$ACME_HOME/xui.example.com_ecc"
+    printf 'old-hy2\n' >"$ACME_HOME/203.0.113.10_ecc/cert"
+    printf 'old-xui\n' >"$ACME_HOME/xui.example.com_ecc/cert"
+    printf 'old-account\n' >"$ACME_HOME/account.conf"
+    begin_transaction 203.0.113.10 || fail "order snapshot failed"
+    [[ ! -d "$TRANSACTION_DIR/acme_home" ]] || fail "shared ACME home was snapshotted"
+    printf 'changed-hy2\n' >"$ACME_HOME/203.0.113.10_ecc/cert"
+    printf 'renewed-xui\n' >"$ACME_HOME/xui.example.com_ecc/cert"
+    printf 'changed-account\n' >"$ACME_HOME/account.conf"
+    rollback_transaction || fail "order rollback failed"
+    assert_contains "$ACME_HOME/203.0.113.10_ecc/cert" old-hy2
+    assert_contains "$ACME_HOME/xui.example.com_ecc/cert" renewed-xui
+    assert_contains "$ACME_HOME/account.conf" changed-account
+
+    begin_transaction new.example.com || fail "new order snapshot failed"
+    mkdir -p "$ACME_HOME/new.example.com_ecc"
+    printf 'new-cert\n' >"$ACME_HOME/new.example.com_ecc/cert"
+    rollback_transaction || fail "new order cleanup failed"
+    [[ ! -e "$ACME_HOME/new.example.com_ecc" ]] || fail "failed new order was retained"
+    assert_contains "$ACME_HOME/xui.example.com_ecc/cert" renewed-xui
+
+    begin_transaction replacement.example.com 203.0.113.10 || fail "certificate-switch snapshot failed"
+    printf 'removed-old-order\n' >"$ACME_HOME/203.0.113.10_ecc/cert"
+    mkdir -p "$ACME_HOME/replacement.example.com_ecc"
+    printf 'replacement\n' >"$ACME_HOME/replacement.example.com_ecc/cert"
+    rollback_transaction || fail "certificate-switch rollback failed"
+    assert_contains "$ACME_HOME/203.0.113.10_ecc/cert" old-hy2
+    [[ ! -e "$ACME_HOME/replacement.example.com_ecc" ]] || fail "replacement order survived rollback"
+    assert_contains "$ACME_HOME/xui.example.com_ecc/cert" renewed-xui
+
+    begin_transaction 203.0.113.10 || fail "invalid order path snapshot failed"
+    sed -i "s|^acme_order_path=.*|acme_order_path=$ACME_HOME/../outside_ecc|" "$TRANSACTION_DIR/manifest"
+    printf 'keep-live\n' >"$CONFIG_FILE"
+    if rollback_transaction 2>/dev/null; then fail "tampered order path was accepted"; fi
+    assert_contains "$CONFIG_FILE" keep-live
+    safe_remove_tree "$TRANSACTION_DIR"
+)
 
 # A failed restore must keep the snapshot for manual recovery.
 begin_transaction || fail "second transaction snapshot failed"
@@ -514,6 +746,18 @@ if (
     safe_remove_tree "$TRANSACTION_DIR"
 )
 
+# A core-update rollback must not remove an ACME client installed by someone else.
+(
+    ACME_HOME="$TEST_ROOT/external-acme-after-snapshot"
+    ACME_OWNED=1
+    begin_transaction || fail "core-only transaction failed"
+    mkdir -p "$ACME_HOME"
+    printf '#!/bin/sh\nprintf "Main_Domain KeyLength\\n"\n' >"$ACME_HOME/acme.sh"
+    chmod 700 "$ACME_HOME/acme.sh"
+    rollback_transaction || fail "core-only rollback failed"
+    [[ -x "$ACME_HOME/acme.sh" ]] || fail "external ACME client was removed"
+)
+
 # A crontab filtering error must not overwrite unrelated jobs.
 (
     mkdir -p "$HY2_TEST_ROOT/etc"
@@ -551,17 +795,105 @@ if (
     check_service_health || fail "healthy service was rejected"
 )
 
+# Retire the old writer before changing certificates, and restore it on later failure.
+(
+    CONFIG_DIR="$TEST_ROOT/certificate-switch/etc/hysteria"
+    CONFIG_FILE="$CONFIG_DIR/config.yaml"; STATE_FILE="$CONFIG_DIR/installer-state.conf"
+    CERT_FILE="$CONFIG_DIR/server.crt"; KEY_FILE="$CONFIG_DIR/server.key"; BACKUP_DIR="$CONFIG_DIR/backups"
+    CLIENT_DIR="$TEST_ROOT/certificate-switch/client"
+    SERVICE_FILE="$TEST_ROOT/certificate-switch/systemd/hysteria-server.service"
+    SERVICE_TEMPLATE_FILE="$TEST_ROOT/certificate-switch/systemd/hysteria-server@.service"
+    MANAGEMENT_BIN="$TEST_ROOT/certificate-switch/bin/hy2"; HYSTERIA_BIN="$TEST_ROOT/certificate-switch/bin/hysteria"
+    HYSTERIA_HOME_DIR="$TEST_ROOT/certificate-switch/home"
+    ACME_HOME="$TEST_ROOT/certificate-switch/acme"
+    PUBLIC_IP=203.0.113.10; SERVER_ADDRESS="$PUBLIC_IP"; SERVER_PORT=24443
+    AUTH_PASSWORD=switch-auth; OBFS_PASSWORD=switch-obfs
+    TLS_SNI="$PUBLIC_IP"; TLS_INSECURE=0; TLS_PIN_SHA256=""; CERT_MODE=ip-acme
+    ACME_CHALLENGE_METHOD=standalone; ACME_CHALLENGE_PORT=80; ACME_WEBROOT=""
+    ACME_OWNED=0; ACME_CERT_OWNED=0; HYSTERIA_USER_OWNED=0; HYSTERIA_CORE_OWNED=0; UNINSTALL_PENDING=0
+    FAILED_ACME_IDENTIFIER=""; FAILED_ACME_CERT_OWNED=0
+    export HY2_TEST_SWITCH_ORDER="$ACME_HOME/${PUBLIC_IP}_ecc/$PUBLIC_IP.conf"
+    mkdir -p "$CONFIG_DIR" "$ACME_HOME/${PUBLIC_IP}_ecc" "$ACME_HOME/panel.example.com_ecc"
+    printf "Le_Webroot='no'\nLe_RealKeyPath='%s'\nLe_RealFullChainPath='%s'\n" "$KEY_FILE" "$CERT_FILE" >"$HY2_TEST_SWITCH_ORDER"
+    printf 'panel-order\n' >"$ACME_HOME/panel.example.com_ecc/cert"
+    printf 'original-certificate\n' >"$CERT_FILE"
+    printf 'original-key\n' >"$KEY_FILE"
+    printf 'original-config\n' >"$CONFIG_FILE"
+    save_installer_state
+    cat >"$ACME_HOME/acme.sh" <<'EOF'
+#!/bin/sh
+test "$1" = --remove || exit 99
+test "${HY2_TEST_REMOVE_FAIL:-0}" = 0 || exit 1
+test -f "$HY2_TEST_SWITCH_ORDER" || exit 1
+mv "$HY2_TEST_SWITCH_ORDER" "$HY2_TEST_SWITCH_ORDER.removed"
+EOF
+    chmod 700 "$ACME_HOME/acme.sh"
+    check_udp_port_available() { return 0; }
+    systemctl() { return 0; }
+    install_core_and_unit() { return 0; }
+    generate_self_signed_certificate() {
+        [[ ! -f "$HY2_TEST_SWITCH_ORDER" ]] || fail "the old order was active during certificate replacement"
+        printf 'new-certificate\n' >"$CERT_FILE"
+        TLS_INSECURE=1; TLS_PIN_SHA256=new-pin
+    }
+    activation_fail=1
+    activate_server_config() { printf 'new-config\n' >"$CONFIG_FILE"; return "$activation_fail"; }
+    generate_client_configs() { return 0; }
+    install_management_command() { return 0; }
+    secure_files() { return 0; }
+    cleanup_legacy_artifacts() { return 0; }
+    print_client_result() { return 0; }
+
+    (
+        begin_transaction() { fail "an external writer reached the transaction"; }
+        if perform_install selfsigned 2>/dev/null; then fail "external ACME writer was retained while switching certificates"; fi
+    )
+    assert_contains "$CERT_FILE" original-certificate
+    ACME_CERT_OWNED=1
+    save_installer_state
+    export HY2_TEST_REMOVE_FAIL=1
+    if perform_install selfsigned 2>/dev/null; then fail "failed order removal did not stop certificate switching"; fi
+    assert_contains "$CERT_FILE" original-certificate
+    [[ -f "$HY2_TEST_SWITCH_ORDER" ]] || fail "failed removal lost the old order"
+
+    export HY2_TEST_REMOVE_FAIL=0
+    load_installer_state
+    if perform_install selfsigned 2>/dev/null; then fail "failed activation did not roll back certificate switching"; fi
+    assert_contains "$CERT_FILE" original-certificate
+    assert_contains "$CONFIG_FILE" original-config
+    [[ -f "$HY2_TEST_SWITCH_ORDER" && ! -f "$HY2_TEST_SWITCH_ORDER.removed" ]] || fail "rollback did not reactivate the old order"
+    assert_eq "$(state_get cert_mode)" ip-acme
+
+    load_installer_state
+    activation_fail=0
+    perform_install selfsigned || fail "safe certificate switch failed"
+    assert_eq "$(state_get cert_mode)" selfsigned
+    [[ ! -f "$HY2_TEST_SWITCH_ORDER" && -f "$HY2_TEST_SWITCH_ORDER.removed" ]] || fail "successful switch left the old writer active"
+    assert_contains "$ACME_HOME/panel.example.com_ecc/cert" panel-order
+    # A crash before saving cleanup progress must still permit another removal attempt.
+    remove_acme_order_if_owned "$PUBLIC_IP" 1 || fail "an already removed order blocked retry"
+)
+
 # A late uninstall failure retains state and permits retry without config.yaml.
 (
     require_root() { return 0; }
     cleanup_legacy_artifacts() { return 0; }
-    remove_acme_assets() { return 0; }
     systemctl() { return 0; }
     PUBLIC_IP=203.0.113.10; SERVER_ADDRESS="$PUBLIC_IP"; SERVER_PORT=24443
     AUTH_PASSWORD=uninstall-auth; OBFS_PASSWORD=uninstall-obfs
-    CERT_MODE=selfsigned; TLS_SNI="$PUBLIC_IP"; TLS_INSECURE=1; TLS_PIN_SHA256=example-pin
-    ACME_CHALLENGE_PORT=""; ACME_OWNED=0; ACME_CERT_OWNED=0
+    CERT_MODE=ip-acme; TLS_SNI="$PUBLIC_IP"; TLS_INSECURE=0; TLS_PIN_SHA256=""
+    ACME_CHALLENGE_PORT=80; ACME_CHALLENGE_METHOD=standalone; ACME_WEBROOT=""; ACME_OWNED=0; ACME_CERT_OWNED=1
     HYSTERIA_CORE_OWNED=1; HYSTERIA_USER_OWNED=0; UNINSTALL_PENDING=0
+    export HY2_TEST_UNINSTALL_ORDER="$ACME_HOME/${PUBLIC_IP}_ecc/$PUBLIC_IP.conf"
+    mkdir -p "$ACME_HOME/${PUBLIC_IP}_ecc"
+    printf "Le_Webroot='no'\n" >"$HY2_TEST_UNINSTALL_ORDER"
+    cat >"$ACME_HOME/acme.sh" <<'EOF'
+#!/bin/sh
+test "$1" = --remove || exit 99
+test -f "$HY2_TEST_UNINSTALL_ORDER" || exit 1
+mv "$HY2_TEST_UNINSTALL_ORDER" "$HY2_TEST_UNINSTALL_ORDER.removed"
+EOF
+    chmod 700 "$ACME_HOME/acme.sh"
     save_installer_state
     rm() {
         if [[ "${2:-}" == "$MANAGEMENT_BIN" ]]; then return 1; fi
@@ -571,6 +903,7 @@ if (
     [[ -f "$STATE_FILE" && -f "$MANAGEMENT_BIN" ]] || fail "retry state or management command was deleted"
     [[ ! -e "$CONFIG_FILE" ]] || fail "uninstall failure was not exercised after config removal"
     assert_eq "$(state_get uninstall_pending)" 1
+    assert_eq "$(state_get acme_cert_owned)" 0
     if read_current_config 2>/dev/null; then fail "pending uninstall was treated as a usable install"; fi
     if quick_install 0 2>/dev/null; then fail "pending uninstall was overwritten by installation"; fi
     unset -f rm

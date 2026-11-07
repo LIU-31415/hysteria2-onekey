@@ -4,7 +4,7 @@
 set -o pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.0.9"
+readonly SCRIPT_VERSION="2.0.11"
 readonly CORE_INSTALLER_URL="https://get.hy2.sh/"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh"
 readonly MIN_SAFE_CORE_VERSION="2.9.2"
@@ -48,6 +48,8 @@ TLS_SNI=""
 TLS_INSECURE="0"
 TLS_PIN_SHA256=""
 ACME_CHALLENGE_PORT=""
+ACME_CHALLENGE_METHOD=""
+ACME_WEBROOT=""
 ACME_OWNED="0"
 ACME_CERT_OWNED="0"
 HYSTERIA_USER_OWNED="0"
@@ -58,6 +60,7 @@ FAILED_ACME_CERT_OWNED="0"
 TRANSACTION_DIR=""
 TRANSACTION_ACTIVE="0"
 TRANSACTION_SNAPSHOTTING="0"
+TRANSACTION_ACME_CLIENT_CREATED="0"
 TEMP_FILES=()
 TEMP_DIRS=()
 
@@ -123,6 +126,10 @@ is_safe_tree_path() {
     local target="$1" resolved
     case "$target" in
         "$CONFIG_DIR"|"$CLIENT_DIR"|"$BACKUP_DIR"|"$ACME_HOME"|"$HYSTERIA_HOME_DIR"|/tmp/hy2-transaction.*|/tmp/hy2-certcheck.*) ;;
+        "$ACME_HOME"/*_ecc)
+            local identifier="${target#"$ACME_HOME"/}"
+            [[ "$(acme_order_path "${identifier%_ecc}")" == "$target" ]] || return 1
+            ;;
         *) return 1 ;;
     esac
     if [[ "${HY2_TEST_MODE:-0}" == "1" ]]; then
@@ -291,6 +298,19 @@ require_root() {
     is_root || die "请使用 root 运行：sudo bash hysteria.sh"
 }
 
+acquire_operation_lock() {
+    local lock_file="/run/hy2-installer.lock"
+    if [[ "${HY2_TEST_MODE:-0}" == 1 ]]; then lock_file="$HY2_TEST_ROOT/hy2-installer.lock"; fi
+    has_cmd flock || { error "缺少系统命令 flock，请安装 util-linux 后重试。"; return 1; }
+    [[ ! -L "$lock_file" ]] || return 1
+    exec 9>"$lock_file" || return 1
+    if ! flock -n 9; then
+        exec 9>&-
+        error "另一个 hy2 正在运行，请退出该操作后重试。"
+        return 1
+    fi
+}
+
 detect_os() {
     [[ -r /etc/os-release ]] || { die "无法识别系统，仅支持使用 systemd 的主流 Linux 发行版。"; return 1; }
     # shellcheck disable=SC1091
@@ -340,7 +360,7 @@ fetch_public_ip() {
     local candidate family url
     for family in 4 6; do
         for url in https://api64.ipify.org https://ifconfig.co/ip https://icanhazip.com; do
-            candidate="$(curl -"$family"fsS --connect-timeout 4 --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]')" || true
+            candidate="$(curl --noproxy '*' -"$family"fsS --connect-timeout 4 --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]')" || true
             if valid_ip "$candidate"; then
                 PUBLIC_IP="$candidate"
                 return 0
@@ -475,10 +495,12 @@ abort_transaction_snapshot() {
 }
 
 begin_transaction() {
+    local identifier="${1:-}" previous_identifier="${2:-}" order_path="" previous_order_path=""
     [[ "$TRANSACTION_ACTIVE" == "0" ]] || return 1
     managed_paths_are_safe || return 1
     # A retained failed-rollback snapshot must not be overwritten by a new operation.
     [[ -z "$TRANSACTION_DIR" ]] || { error "请先处理保留的快照：$TRANSACTION_DIR"; return 1; }
+    TRANSACTION_ACME_CLIENT_CREATED="0"
     TRANSACTION_SNAPSHOTTING="1"
     TRANSACTION_DIR="$(mktemp -d /tmp/hy2-transaction.XXXXXX)" || { TRANSACTION_SNAPSHOTTING="0"; return 1; }
     : >"$TRANSACTION_DIR/manifest" || { abort_transaction_snapshot; return 1; }
@@ -488,7 +510,20 @@ begin_transaction() {
     snapshot_path service_template_file "$SERVICE_TEMPLATE_FILE" || { abort_transaction_snapshot; return 1; }
     snapshot_path management_bin "$MANAGEMENT_BIN" || { abort_transaction_snapshot; return 1; }
     snapshot_path hysteria_bin "$HYSTERIA_BIN" || { abort_transaction_snapshot; return 1; }
-    snapshot_path acme_home "$ACME_HOME" || { abort_transaction_snapshot; return 1; }
+    if [[ -n "$identifier" ]]; then
+        order_path="$(acme_order_path "$identifier")" || { abort_transaction_snapshot; return 1; }
+        snapshot_path acme_order "$order_path" || { abort_transaction_snapshot; return 1; }
+    else
+        printf 'acme_order=0\n' >>"$TRANSACTION_DIR/manifest" || { abort_transaction_snapshot; return 1; }
+    fi
+    printf 'acme_order_path=%s\n' "$order_path" >>"$TRANSACTION_DIR/manifest" || { abort_transaction_snapshot; return 1; }
+    if [[ -n "$previous_identifier" && "$previous_identifier" != "$identifier" ]]; then
+        previous_order_path="$(acme_order_path "$previous_identifier")" || { abort_transaction_snapshot; return 1; }
+        snapshot_path previous_acme_order "$previous_order_path" || { abort_transaction_snapshot; return 1; }
+    else
+        printf 'previous_acme_order=0\n' >>"$TRANSACTION_DIR/manifest" || { abort_transaction_snapshot; return 1; }
+    fi
+    printf 'previous_acme_order_path=%s\n' "$previous_order_path" >>"$TRANSACTION_DIR/manifest" || { abort_transaction_snapshot; return 1; }
     snapshot_path hysteria_home_dir "$HYSTERIA_HOME_DIR" || { abort_transaction_snapshot; return 1; }
     local user=0 active=0 enabled=0
     id hysteria >/dev/null 2>&1 && user=1
@@ -511,13 +546,22 @@ snapshot_record_is_valid() {
 }
 
 transaction_snapshot_is_valid() {
-    local label value
-    for label in config_dir client_dir service_file service_template_file management_bin hysteria_bin acme_home hysteria_home_dir; do
+    local label value order_path identifier
+    for label in config_dir client_dir service_file service_template_file management_bin hysteria_bin acme_order previous_acme_order hysteria_home_dir; do
         snapshot_record_is_valid "$label" || return 1
     done
     for label in hysteria_user service_active service_enabled; do
         value="$(state_get_from "$TRANSACTION_DIR/manifest" "$label")" || return 1
         [[ "$value" == 0 || "$value" == 1 ]] || return 1
+    done
+    for label in acme_order previous_acme_order; do
+        order_path="$(state_get_from "$TRANSACTION_DIR/manifest" "${label}_path")" || return 1
+        if [[ -n "$order_path" ]]; then
+            identifier="${order_path#"$ACME_HOME"/}"
+            [[ "$(acme_order_path "${identifier%_ecc}")" == "$order_path" ]] || return 1
+        else
+            [[ "$(state_get_from "$TRANSACTION_DIR/manifest" "$label")" == 0 ]] || return 1
+        fi
     done
 }
 
@@ -552,7 +596,7 @@ restore_snapshot_path() {
 }
 
 rollback_transaction() {
-    local rollback_failed=0 snapshot_dir="$TRANSACTION_DIR"
+    local rollback_failed=0 snapshot_dir="$TRANSACTION_DIR" order_path label
     [[ "$TRANSACTION_ACTIVE" == "1" ]] || return 0
     if ! transaction_snapshot_is_valid; then
         TRANSACTION_ACTIVE="0"
@@ -567,10 +611,16 @@ rollback_transaction() {
     restore_snapshot_path service_template_file "$SERVICE_TEMPLATE_FILE" || rollback_failed=1
     restore_snapshot_path management_bin "$MANAGEMENT_BIN" || rollback_failed=1
     restore_snapshot_path hysteria_bin "$HYSTERIA_BIN" || rollback_failed=1
-    if [[ "$(state_get_from "$TRANSACTION_DIR/manifest" acme_home 2>/dev/null || printf '0')" == "0" && -x "$ACME_HOME/acme.sh" ]]; then
-        "$ACME_HOME/acme.sh" --uninstall >/dev/null 2>&1 || rollback_failed=1
+    # Shared ACME accounts and other certificate orders may have changed independently.
+    for label in acme_order previous_acme_order; do
+        order_path="$(state_get_from "$TRANSACTION_DIR/manifest" "${label}_path")"
+        if [[ -n "$order_path" ]]; then
+            restore_snapshot_path "$label" "$order_path" || rollback_failed=1
+        fi
+    done
+    if [[ "$TRANSACTION_ACME_CLIENT_CREATED" == 1 ]]; then
+        cleanup_owned_acme_client || rollback_failed=1
     fi
-    restore_snapshot_path acme_home "$ACME_HOME" || rollback_failed=1
     restore_snapshot_path hysteria_home_dir "$HYSTERIA_HOME_DIR" || rollback_failed=1
     if [[ "$(state_get_from "$TRANSACTION_DIR/manifest" hysteria_user 2>/dev/null || printf '0')" == "0" ]] && id hysteria >/dev/null 2>&1; then
         userdel hysteria >/dev/null 2>&1 || rollback_failed=1
@@ -635,15 +685,108 @@ tcp_port_in_use() {
     ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .
 }
 
+check_udp_port_available() {
+    local listeners listener pids main_pid="" owned=0
+    listeners="$(ss -H -lunp "sport = :$SERVER_PORT" 2>/dev/null)" || {
+        error "无法检查 UDP $SERVER_PORT 的占用情况，已停止修改。"; return 1
+    }
+    [[ -n "$listeners" ]] || return 0
+    if has_valid_installer_state; then
+        main_pid="$(systemctl show "$SERVICE_NAME" -p MainPID --value 2>/dev/null)" || main_pid=""
+    fi
+    if [[ "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
+        owned=1
+        while IFS= read -r listener; do
+            pids="$(grep -oE 'pid=[0-9]+' <<<"$listener" | sort -u)" || pids=""
+            if [[ "$pids" != "pid=$main_pid" ]]; then owned=0; break; fi
+        done <<<"$listeners"
+    fi
+    [[ "$owned" == 1 ]] && return 0
+    error "UDP $SERVER_PORT 已被其他进程占用，请在自定义安装中选择空闲端口。"
+    return 1
+}
+
 select_acme_challenge_port() {
+    ACME_WEBROOT=""
     if ! tcp_port_in_use 443; then
         ACME_CHALLENGE_PORT="443"
+        ACME_CHALLENGE_METHOD="alpn"
     elif ! tcp_port_in_use 80; then
         ACME_CHALLENGE_PORT="80"
+        ACME_CHALLENGE_METHOD="standalone"
     else
         error "TCP 443 和 TCP 80 都被占用，无法自动完成 ACME 验证。"
         return 1
     fi
+}
+
+acme_order_path() {
+    local identifier="$1" path="$ACME_HOME/${1}_ecc"
+    valid_ip "$identifier" || valid_hostname "$identifier" || return 1
+    [[ ! -L "$path" && "$(readlink -m -- "$path")" == "$path" ]] || return 1
+    printf '%s' "$path"
+}
+
+acme_config_value() {
+    local identifier="$1" key="$2" path value
+    path="$(acme_order_path "$identifier")" || return 1
+    value="$(state_get_from "$path/$identifier.conf" "$key")" || return 1
+    # Read acme.sh's quoted values as data; never source a certificate config.
+    [[ "$value" == \'*\' && ${#value} -ge 2 ]] || return 1
+    printf '%s' "${value:1:${#value}-2}"
+}
+
+read_acme_challenge() {
+    local value
+    value="$(acme_config_value "$1" Le_Webroot)" || { error "无法读取当前证书的 ACME 验证方式，已保留原配置。"; return 1; }
+    ACME_WEBROOT=""
+    case "$value" in
+        alpn) ACME_CHALLENGE_METHOD=alpn; ACME_CHALLENGE_PORT=443 ;;
+        no) ACME_CHALLENGE_METHOD=standalone; ACME_CHALLENGE_PORT=80 ;;
+        /*)
+            [[ "$value" != / && ! "$value" =~ [[:cntrl:],] ]] || { error "ACME webroot 路径无效。"; return 1; }
+            ACME_CHALLENGE_METHOD=webroot; ACME_CHALLENGE_PORT=80; ACME_WEBROOT="$value"
+            ;;
+        *) error "当前 ACME 验证方式暂不支持自动修改，已保留原配置。"; return 1 ;;
+    esac
+}
+
+check_acme_webroot() {
+    local identifier="$1" directory probe token response status=0
+    [[ -d "$ACME_WEBROOT" && -w "$ACME_WEBROOT" ]] || { error "ACME 验证目录不存在或不可写：$ACME_WEBROOT"; return 1; }
+    directory="$ACME_WEBROOT/.well-known"
+    [[ -d "$directory" ]] || mkdir -m 755 -- "$directory" || return 1
+    directory+="/acme-challenge"
+    [[ -d "$directory" ]] || mkdir -m 755 -- "$directory" || return 1
+    probe="$(mktemp "$directory/hy2-check.XXXXXXXX")" || return 1
+    TEMP_FILES+=("$probe")
+    token="$(random_secret 32)" || { rm -f -- "$probe"; return 1; }
+    if ! printf '%s\n' "$token" >"$probe" || ! chmod 644 "$probe"; then rm -f -- "$probe"; return 1; fi
+    response="$(curl --noproxy '*' --proto '=http' --connect-timeout 5 --max-time 10 -fsS \
+        "http://$(host_for_uri "$identifier")/.well-known/acme-challenge/${probe##*/}")" || status=1
+    [[ "$response" == "$token" ]] || status=1
+    rm -f -- "$probe" || return 1
+    if ((status != 0)); then
+        error "HTTP 验证文件无法通过 TCP 80 访问，请检查网站目录、域名解析和端口放行。"
+        return 1
+    fi
+}
+
+diagnose_acme_challenge() {
+    case "$ACME_CHALLENGE_METHOD" in
+        webroot)
+            printf '[INFO] HTTP-01/webroot：%s（TCP 80，复用网站服务）\n' "$ACME_WEBROOT"
+            check_acme_webroot "$TLS_SNI" || return 1
+            printf '[OK] HTTP 验证文件可访问；公网验证以证书机构实际检查为准\n'
+            ;;
+        alpn|standalone)
+            printf '[INFO] ACME 独立验证：%s，TCP %s\n' "$ACME_CHALLENGE_METHOD" "$ACME_CHALLENGE_PORT"
+            if tcp_port_in_use "$ACME_CHALLENGE_PORT"; then
+                printf '[WARN] TCP %s 当前被占用，下一次独立 ACME 验证可能无法绑定该端口\n' "$ACME_CHALLENGE_PORT"
+            fi
+            ;;
+        *) error "无法确定 ACME 验证方式，请检查证书订单配置。"; return 1 ;;
+    esac
 }
 
 ensure_cron_available() {
@@ -669,7 +812,24 @@ ensure_cron_available() {
 }
 
 acme_cron_present() {
-    has_cmd crontab && crontab -l 2>/dev/null | grep -Fq 'acme.sh --cron'
+    has_cmd crontab && crontab -l 2>/dev/null | awk -v executable="$ACME_HOME/acme.sh" -v home="$ACME_HOME" '
+        /^[[:space:]]*#/ {next}
+        {
+            line=$0; sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+#.*/, "", line)
+            if (line ~ /^@/) sub(/^[^[:space:]]+[[:space:]]+/, "", line)
+            else for (i=0; i<5; i++) sub(/^[^[:space:]]+[[:space:]]+/, "", line)
+            gsub(/["\047]/, "", line)
+            n=split(line, args, /[[:space:]]+/); start=1; wrong_home=0
+            if (args[1] ~ /^(\/bin\/)?(ba)?sh$/) start=2
+            if (args[start] != executable || args[start+1] != "--cron") next
+            for (i=start+2; i<=n; i++) {
+                if (args[i] ~ /^--(home|config-home|cert-home)$/ && args[i+1] != home) wrong_home=1
+            }
+            if (!wrong_home) found=1
+        }
+        END {exit !found}
+    '
 }
 
 ensure_acme_cron_job() {
@@ -698,7 +858,10 @@ install_acme_client() {
     sh "$installer" --no-profile || { rm -f "$installer"; return 1; }
     rm -f "$installer"
     [[ -x "$ACME_HOME/acme.sh" ]] || return 1
-    [[ "$existed" == "0" ]] && ACME_OWNED="1"
+    if [[ "$existed" == 0 ]]; then
+        ACME_OWNED="1"
+        [[ "$TRANSACTION_ACTIVE" != 1 ]] || TRANSACTION_ACME_CLIENT_CREATED="1"
+    fi
     return 0
 }
 
@@ -759,20 +922,36 @@ warn_certificate_client_compatibility() {
 }
 
 issue_acme_certificate() {
-    local identifier="$1" mode="$2" order_preexisting=0 acme=("$ACME_HOME/acme.sh") challenge_args=()
+    local identifier="$1" mode="$2" order_preexisting=0 order_path acme=("$ACME_HOME/acme.sh") challenge_args=()
     FAILED_ACME_CERT_OWNED="0"
     ensure_cron_available || return 1
     install_acme_client || return 1
     if [[ "$mode" == "ip-acme" ]]; then check_acme_version || return 1; fi
+    order_path="$(acme_order_path "$identifier")" || return 1
+    [[ ! -f "$order_path/$identifier.conf" ]] || order_preexisting=1
     acme_has_certificate "$identifier" && order_preexisting=1
+    if [[ "$order_preexisting" == 0 && "$(state_get cert_mode 2>/dev/null || true)" == "$mode" &&
+          "$(state_get tls_sni 2>/dev/null || true)" == "$identifier" ]]; then
+        error "安装状态记录了现有 ACME 证书，但续期订单缺失，已停止修改；请先恢复订单配置。"
+        return 1
+    fi
+    if [[ "$order_preexisting" == 1 ]]; then
+        read_acme_challenge "$identifier" || return 1
+        if [[ "$(acme_config_value "$identifier" Le_RealKeyPath)" != "$KEY_FILE" ||
+              "$(acme_config_value "$identifier" Le_RealFullChainPath)" != "$CERT_FILE" ]]; then
+            error "已有证书订单部署到其他路径，已停止修改，避免覆盖其他服务的续期配置。"
+            return 1
+        fi
+    else
+        select_acme_challenge_port || return 1
+    fi
     if [[ -f "$STATE_FILE" && -x "$ACME_HOME/acme.sh" ]] &&
         [[ "$(state_get cert_mode 2>/dev/null || true)" == "$mode" ]] &&
         [[ "$(state_get tls_sni 2>/dev/null || true)" == "$identifier" ]] &&
-        acme_has_certificate "$identifier" &&
+        [[ "$order_preexisting" == 1 ]] &&
         validate_certificate_pair "$CERT_FILE" "$KEY_FILE" "$identifier" &&
         certificate_is_system_trusted "$CERT_FILE" &&
         ensure_acme_cron_job; then
-        ACME_CHALLENGE_PORT="$(state_get acme_challenge_port 2>/dev/null || true)"
         TLS_SNI="$identifier"; TLS_INSECURE="0"; TLS_PIN_SHA256=""
         info "现有可信证书仍有效，继续使用并保留自动续期。"
         return 0
@@ -780,8 +959,9 @@ issue_acme_certificate() {
     if [[ "$order_preexisting" != "1" ]]; then
         ACME_CERT_OWNED="1"
     fi
-    select_acme_challenge_port || return 1
-    if [[ "$ACME_CHALLENGE_PORT" == "443" ]]; then challenge_args=(--alpn); else challenge_args=(--standalone); fi
+    if [[ "$ACME_CHALLENGE_METHOD" == webroot ]]; then
+        check_acme_webroot "$identifier" || return 1
+    fi
 
     if [[ "$mode" == "ip-acme" ]]; then
         info "申请 Let's Encrypt 短期公网 IP 证书（标识：$identifier）"
@@ -789,11 +969,16 @@ issue_acme_certificate() {
         info "申请 Let's Encrypt 域名证书（标识：$identifier）"
     fi
     [[ "$order_preexisting" == "1" ]] || FAILED_ACME_CERT_OWNED="1"
-    local issue_args=(--issue "${challenge_args[@]}" -d "$identifier" --server letsencrypt --keylength ec-256)
-    [[ "$mode" == "ip-acme" ]] && issue_args+=(--certificate-profile shortlived --days -3)
-    "${acme[@]}" "${issue_args[@]}" || return 1
-    "${acme[@]}" --install-cert -d "$identifier" --ecc \
-        --key-file "$KEY_FILE" --fullchain-file "$CERT_FILE" || return 1
+    if [[ "$order_preexisting" == 1 ]]; then
+        "${acme[@]}" --renew -d "$identifier" --ecc --force || return 1
+    else
+        if [[ "$ACME_CHALLENGE_METHOD" == alpn ]]; then challenge_args=(--alpn); else challenge_args=(--standalone); fi
+        local issue_args=(--issue "${challenge_args[@]}" -d "$identifier" --server letsencrypt --keylength ec-256)
+        [[ "$mode" == "ip-acme" ]] && issue_args+=(--certificate-profile shortlived --days -3)
+        "${acme[@]}" "${issue_args[@]}" || return 1
+        "${acme[@]}" --install-cert -d "$identifier" --ecc --key-file "$KEY_FILE" --fullchain-file "$CERT_FILE" \
+            --reloadcmd "systemctl try-restart $SERVICE_NAME" || return 1
+    fi
     validate_certificate_pair "$CERT_FILE" "$KEY_FILE" "$identifier" || return 1
     certificate_is_system_trusted "$CERT_FILE" || { error "ACME 返回的证书链未通过系统信任校验。"; return 1; }
     ensure_acme_cron_job || { error "无法建立 acme.sh 自动续期任务。"; return 1; }
@@ -835,22 +1020,35 @@ configure_existing_certificate() {
 }
 
 configure_quick_certificate() {
+    local existing_order=0 order_path
+    order_path="$(acme_order_path "$PUBLIC_IP")" || return 1
+    [[ ! -f "$order_path/$PUBLIC_IP.conf" ]] || existing_order=1
+    if [[ "$(state_get cert_mode 2>/dev/null || true)" == ip-acme &&
+          "$(state_get tls_sni 2>/dev/null || true)" == "$PUBLIC_IP" ]]; then existing_order=1; fi
     CERT_MODE="ip-acme"
     TLS_SNI="$PUBLIC_IP"
     if issue_acme_certificate "$PUBLIC_IP" ip-acme; then
         success "已启用可信 IP 证书，无需域名或跳过证书验证。"
         return 0
     fi
+    if [[ "$existing_order" == 1 ]]; then
+        error "现有 ACME 证书处理失败，已停止修改；不会自动切换验证方式或改用自签名证书。"
+        return 1
+    fi
     warn "可信 IP 证书申请失败，自动改用带指纹校验的自签名证书。"
     FAILED_ACME_IDENTIFIER="$PUBLIC_IP"
     ACME_CERT_OWNED="0"
-    CERT_MODE="selfsigned"; ACME_CHALLENGE_PORT=""
+    CERT_MODE="selfsigned"; ACME_CHALLENGE_PORT=""; ACME_CHALLENGE_METHOD=""; ACME_WEBROOT=""
     generate_self_signed_certificate "$PUBLIC_IP"
 }
 
 remove_acme_order_if_owned() {
-    local identifier="$1" owned="$2"
-    [[ "$owned" == "1" && -n "$identifier" && -x "$ACME_HOME/acme.sh" ]] || return 0
+    local identifier="$1" owned="$2" order_path
+    [[ "$owned" == "1" && -n "$identifier" ]] || return 0
+    order_path="$(acme_order_path "$identifier")" || return 1
+    # acme.sh --remove renames the config; a retry must accept that completed step.
+    if [[ ! -e "$order_path/$identifier.conf" && -f "$order_path/$identifier.conf.removed" ]]; then return 0; fi
+    [[ -x "$ACME_HOME/acme.sh" ]] || { error "ACME 客户端缺失，无法停用旧证书订单。"; return 1; }
     "$ACME_HOME/acme.sh" --remove -d "$identifier" --ecc >/dev/null 2>&1 || {
         warn "无法删除脚本创建的 ACME 证书订单：$identifier"
         return 1
@@ -876,15 +1074,23 @@ cleanup_owned_acme_client() {
 }
 
 cleanup_previous_acme_certificate() {
-    local previous_mode="$1" previous_identifier="$2" previous_owned="$3"
+    local previous_mode="$1" previous_identifier="$2" previous_owned="$3" next_mode="$4" next_identifier="$5"
+    local order_path key target
     [[ "$previous_mode" == "ip-acme" || "$previous_mode" == "domain-acme" ]] || return 0
     [[ -n "$previous_identifier" ]] || return 0
-    if [[ "$previous_mode" == "$CERT_MODE" && "$previous_identifier" == "$TLS_SNI" ]]; then return 0; fi
-    if [[ "$previous_identifier" == "$FAILED_ACME_IDENTIFIER" && "$previous_owned" != "1" ]]; then return 0; fi
-    remove_acme_order_if_owned "$previous_identifier" "$previous_owned" || return 1
-    if [[ "$previous_identifier" == "$FAILED_ACME_IDENTIFIER" ]]; then FAILED_ACME_CERT_OWNED="0"; fi
-    if [[ "$CERT_MODE" != "ip-acme" && "$CERT_MODE" != "domain-acme" ]]; then
-        cleanup_owned_acme_client || return 1
+    if [[ ( "$next_mode" == ip-acme || "$next_mode" == domain-acme ) && "$previous_identifier" == "$next_identifier" ]]; then return 0; fi
+    if [[ "$previous_owned" == 1 ]]; then
+        remove_acme_order_if_owned "$previous_identifier" 1 || return 1
+    else
+        order_path="$(acme_order_path "$previous_identifier")" || return 1
+        [[ -f "$order_path/$previous_identifier.conf" ]] || return 0
+        for key in Le_RealKeyPath Le_RealFullChainPath Le_RealCertPath Le_RealCACertPath; do
+            target="$(acme_config_value "$previous_identifier" "$key" 2>/dev/null || true)"
+            if [[ "$target" == "$CERT_FILE" || "$target" == "$KEY_FILE" ]]; then
+                error "旧证书由外部 ACME 订单续期，仍会写入当前证书路径；请先调整该订单，再切换证书。"
+                return 1
+            fi
+        done
     fi
 }
 
@@ -911,6 +1117,8 @@ save_installer_state() {
         printf 'tls_insecure=%s\n' "$TLS_INSECURE"
         printf 'tls_pin_sha256=%s\n' "$TLS_PIN_SHA256"
         printf 'acme_challenge_port=%s\n' "$ACME_CHALLENGE_PORT"
+        printf 'acme_challenge_method=%s\n' "$ACME_CHALLENGE_METHOD"
+        printf 'acme_webroot=%s\n' "$ACME_WEBROOT"
         printf 'acme_owned=%s\n' "$ACME_OWNED"
         printf 'acme_cert_owned=%s\n' "$ACME_CERT_OWNED"
         printf 'hysteria_user_owned=%s\n' "$HYSTERIA_USER_OWNED"
@@ -1216,6 +1424,7 @@ load_resource_ownership() {
 }
 
 load_installer_state() {
+    local order_path
     has_valid_installer_state || return 1
     SERVER_ADDRESS="$(state_get server_address)" || return 1
     PUBLIC_IP="$(state_get public_ip)" || return 1
@@ -1227,12 +1436,28 @@ load_installer_state() {
     TLS_INSECURE="$(state_get tls_insecure)" || return 1
     TLS_PIN_SHA256="$(state_get tls_pin_sha256 2>/dev/null || true)"
     ACME_CHALLENGE_PORT="$(state_get acme_challenge_port 2>/dev/null || true)"
+    ACME_CHALLENGE_METHOD="$(state_get acme_challenge_method 2>/dev/null || true)"
+    ACME_WEBROOT="$(state_get acme_webroot 2>/dev/null || true)"
     load_resource_ownership || return 1
     valid_ip "$PUBLIC_IP" && valid_port "$SERVER_PORT" || return 1
     valid_ip "$SERVER_ADDRESS" || valid_hostname "$SERVER_ADDRESS" || return 1
     valid_ip "$TLS_SNI" || valid_hostname "$TLS_SNI" || return 1
     valid_secret "$AUTH_PASSWORD" && valid_secret "$OBFS_PASSWORD" || return 1
     [[ -z "$ACME_CHALLENGE_PORT" || "$ACME_CHALLENGE_PORT" == "80" || "$ACME_CHALLENGE_PORT" == "443" ]] || return 1
+    case "$ACME_CHALLENGE_METHOD" in ''|alpn|standalone|webroot) ;; *) return 1 ;; esac
+    if [[ "$CERT_MODE" == ip-acme || "$CERT_MODE" == domain-acme ]]; then
+        order_path="$(acme_order_path "$TLS_SNI")" || return 1
+        if [[ -f "$order_path/$TLS_SNI.conf" ]]; then
+            read_acme_challenge "$TLS_SNI" || return 1
+        elif [[ -z "$ACME_CHALLENGE_METHOD" ]]; then
+            case "$ACME_CHALLENGE_PORT" in
+                443) ACME_CHALLENGE_METHOD=alpn ;;
+                80) ACME_CHALLENGE_METHOD=standalone ;;
+            esac
+        fi
+    else
+        ACME_CHALLENGE_PORT=""; ACME_CHALLENGE_METHOD=""; ACME_WEBROOT=""
+    fi
     case "$CERT_MODE:$TLS_INSECURE" in
         selfsigned:1) [[ -n "$TLS_PIN_SHA256" ]] ;;
         ip-acme:0|domain-acme:0|existing:0) [[ -z "$TLS_PIN_SHA256" ]] ;;
@@ -1353,7 +1578,8 @@ install_core_and_unit() {
 }
 
 perform_install() {
-    local cert_strategy="$1" source_cert="${2:-}" source_key="${3:-}" previous_cert_mode="" previous_sni="" previous_acme_cert_owned="0"
+    local cert_strategy="$1" source_cert="${2:-}" source_key="${3:-}" previous_cert_mode="" previous_sni="" previous_acme_cert_owned="0" acme_identifier=""
+    local next_mode="$cert_strategy" previous_order_identifier=""
     if [[ -f "$STATE_FILE" ]]; then
         # Validate in a subshell so the user's new settings are not overwritten.
         (load_installer_state) || { error "安装状态不完整或字段无效，已停止修改。"; return 1; }
@@ -1363,7 +1589,21 @@ perform_install() {
         installation_is_not_pending_uninstall || return 1
         previous_acme_cert_owned="$(state_get acme_cert_owned 2>/dev/null || printf '0')"
     fi
-    begin_transaction || return 1
+    case "$cert_strategy" in
+        quick|ip-acme) acme_identifier="$PUBLIC_IP"; next_mode="ip-acme" ;;
+        domain-acme) acme_identifier="$TLS_SNI" ;;
+    esac
+    check_udp_port_available || return 1
+    if [[ "$previous_acme_cert_owned" == 1 && ( "$previous_cert_mode" == ip-acme || "$previous_cert_mode" == domain-acme ) ]]; then
+        previous_order_identifier="$previous_sni"
+    fi
+    if [[ "$previous_acme_cert_owned" != 1 ]]; then
+        cleanup_previous_acme_certificate "$previous_cert_mode" "$previous_sni" "$previous_acme_cert_owned" "$next_mode" "$acme_identifier" || return 1
+    fi
+    begin_transaction "$acme_identifier" "$previous_order_identifier" || return 1
+    if [[ "$previous_acme_cert_owned" == 1 ]] && ! cleanup_previous_acme_certificate "$previous_cert_mode" "$previous_sni" "$previous_acme_cert_owned" "$next_mode" "$acme_identifier"; then
+        rollback_transaction; return 1
+    fi
     if ! install_core_and_unit; then rollback_transaction; return 1; fi
 
     case "$cert_strategy" in
@@ -1384,10 +1624,11 @@ perform_install() {
             ;;
         existing)
             CERT_MODE="existing"; ACME_CERT_OWNED="0"
+            ACME_CHALLENGE_PORT=""; ACME_CHALLENGE_METHOD=""; ACME_WEBROOT=""
             configure_existing_certificate "$source_cert" "$source_key" "$TLS_SNI" || { rollback_transaction; return 1; }
             ;;
         selfsigned)
-            CERT_MODE="selfsigned"; ACME_CHALLENGE_PORT=""; ACME_CERT_OWNED="0"
+            CERT_MODE="selfsigned"; ACME_CHALLENGE_PORT=""; ACME_CHALLENGE_METHOD=""; ACME_WEBROOT=""; ACME_CERT_OWNED="0"
             generate_self_signed_certificate "$TLS_SNI" || { rollback_transaction; return 1; }
             ;;
         *) rollback_transaction; return 1 ;;
@@ -1399,7 +1640,6 @@ perform_install() {
     if ! secure_files; then rollback_transaction; return 1; fi
     commit_transaction || warn "请按上方路径人工删除旧配置快照。"
     cleanup_legacy_artifacts || warn "旧版辅助文件未能完整清理。"
-    cleanup_previous_acme_certificate "$previous_cert_mode" "$previous_sni" "$previous_acme_cert_owned" || warn "旧 ACME 资源已保留。"
     cleanup_failed_acme_attempt || warn "未能完整清理失败的 ACME 申请，相关资源已保留。"
     save_installer_state || warn "配置已生效，但安装器状态文件未能更新。"
     print_client_result
@@ -1495,6 +1735,9 @@ show_config() {
     printf '  地址：%s\n' "$(client_server_value)"
     printf '  证书：%s\n' "$CERT_MODE"
     printf '  SNI：%s\n' "$TLS_SNI"
+    if [[ "$CERT_MODE" == ip-acme || "$CERT_MODE" == domain-acme ]]; then
+        printf '  证书验证：%s%s\n' "$ACME_CHALLENGE_METHOD" "${ACME_WEBROOT:+（$ACME_WEBROOT）}"
+    fi
     printf '  认证密码：%s\n' "$AUTH_PASSWORD"
     printf '  混淆密码：%s\n' "$OBFS_PASSWORD"
     printf '  分享链接：%s\n' "$(cat "$CLIENT_DIR/url.txt")"
@@ -1586,9 +1829,7 @@ diagnose() {
         else
             printf '[FAIL] cron 服务未运行，续期任务不会执行\n'; failures=$((failures + 1))
         fi
-        if [[ -n "$ACME_CHALLENGE_PORT" ]] && tcp_port_in_use "$ACME_CHALLENGE_PORT"; then
-            printf '[WARN] TCP %s 当前被占用，下一次独立 ACME 验证可能无法绑定该端口\n' "$ACME_CHALLENGE_PORT"
-        fi
+        diagnose_acme_challenge || failures=$((failures + 1))
     fi
     if [[ "$CERT_MODE" == "existing" ]]; then
         printf '[WARN] 当前证书是一次性导入副本；源证书续期后需重新导入\n'
@@ -1625,6 +1866,7 @@ update_core() {
     detect_os || return 1
     install_dependencies || return 1
     read_current_config || { error "尚未安装。"; return 1; }
+    check_udp_port_available || return 1
     begin_transaction || return 1
     if ! install_hysteria_core || ! ensure_service_unit || ! systemctl restart "$SERVICE_NAME"; then
         rollback_transaction; return 1
@@ -1640,6 +1882,7 @@ remove_acme_assets() {
     if [[ "$CERT_MODE" == "ip-acme" || "$CERT_MODE" == "domain-acme" ]]; then
         if [[ "$ACME_CERT_OWNED" == "1" ]]; then
             remove_acme_order_if_owned "$identifier" "$ACME_CERT_OWNED" || return 1
+            ACME_CERT_OWNED=0
         else
             warn "当前 ACME 证书订单不是本脚本创建的，已保留：$identifier"
         fi
@@ -1689,6 +1932,7 @@ uninstall_hysteria() {
     fi
     cleanup_legacy_artifacts || { error "旧版辅助文件清理失败；可重新运行 --uninstall。"; return 1; }
     remove_acme_assets "$TLS_SNI" || { error "ACME 清理失败，相关文件与安装状态已保留；可重新运行 --uninstall。"; return 1; }
+    save_installer_state || { error "无法保存 ACME 清理进度，请重新运行 --uninstall。"; return 1; }
     rm -f "$SERVICE_FILE" || return 1
     if [[ "$HYSTERIA_CORE_OWNED" == "1" ]]; then
         rm -f "$SERVICE_TEMPLATE_FILE" "$HYSTERIA_BIN" || return 1
@@ -1766,6 +2010,12 @@ EOF
 }
 
 main() {
+    case "${1:-}" in
+        --install|--update-script|--reinstall|--diagnose|--uninstall|"")
+            require_root || return 1
+            acquire_operation_lock || return 1
+            ;;
+    esac
     case "${1:-}" in
         --install) quick_install 0 ;;
         --update-script) update_script ;;
