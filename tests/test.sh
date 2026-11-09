@@ -117,6 +117,8 @@ assert_not_contains() { ! grep -Fq -- "$2" "$1" || fail "$1 unexpectedly contain
     download_checked_script() {
         printf '#!/usr/bin/env bash\nreadonly SCRIPT_VERSION="%s"\n' "$downloaded_version" >"$2"
     }
+    # Version comparisons do not require the root-only ownership change.
+    atomic_install_file() { cp -- "$1" "$2"; }
     update_script >"$TEST_ROOT/update.log" 2>&1 || fail "a newer installed version was treated as an update failure"
     assert_contains "$MANAGEMENT_BIN" '99.0.0'
 
