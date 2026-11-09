@@ -4,7 +4,7 @@
 set -o pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.0.11"
+readonly SCRIPT_VERSION="2.0.12"
 readonly CORE_INSTALLER_URL="https://get.hy2.sh/"
 readonly REPO_RAW_URL="https://raw.githubusercontent.com/LIU-31415/hysteria2-onekey/master/hysteria.sh"
 readonly MIN_SAFE_CORE_VERSION="2.9.2"
@@ -887,13 +887,43 @@ certificate_matches_key() {
     [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]]
 }
 
+certificate_has_dns_san() {
+    local offset
+    # Inspect ASN.1 tags so text inside URI SANs cannot be mistaken for DNS entries.
+    offset="$(LC_ALL=C openssl asn1parse -in "$1" 2>/dev/null | awk -F: '
+        /:d=2[[:space:]].*cons: cont \[[[:space:]]*3[[:space:]]*\]/ {extensions=1}
+        extensions && /:d=[01][[:space:]]/ {extensions=0}
+        extensions && /:d=5[[:space:]].*prim: OBJECT[[:space:]]*:X509v3 Subject Alternative Name$/ {
+            count++; pending=1; next
+        }
+        pending && /prim: BOOLEAN/ {next}
+        pending {
+            if ($0 ~ /:d=5[[:space:]].*prim: OCTET STRING/) offset=$1
+            pending=0
+        }
+        END {
+            gsub(/[[:space:]]/, "", offset)
+            if (count != 1 || offset !~ /^[0-9]+$/) exit 1
+            print offset
+        }
+    ')" || return 1
+    LC_ALL=C openssl asn1parse -in "$1" -strparse "$offset" 2>/dev/null | awk '
+        /:d=1[[:space:]].*prim: cont \[[[:space:]]*2[[:space:]]*\]/ {found=1}
+        END {exit !found}
+    '
+}
+
 certificate_matches_name() {
-    local cert="$1" name="$2"
+    local cert="$1" name="$2" output option=-checkhost kind=Hostname
     if valid_ip "$name"; then
-        openssl x509 -in "$cert" -noout -checkip "$name" >/dev/null 2>&1
+        option=-checkip; kind=IP
     else
-        openssl x509 -in "$cert" -noout -checkhost "$name" >/dev/null 2>&1
+        valid_hostname "$name" || return 1
+        certificate_has_dns_san "$cert" || return 1
     fi
+    # OpenSSL 1.1.1 can return zero even when the certificate name does not match.
+    output="$(LC_ALL=C openssl x509 -in "$cert" -noout "$option" "$name" 2>/dev/null)" || return 1
+    [[ "$output" == "$kind $name does match certificate" ]]
 }
 
 validate_certificate_pair() {
@@ -1151,13 +1181,15 @@ EOF
 }
 
 rotate_backups() {
-    local old
+    local expired old
     [[ -d "$BACKUP_DIR" ]] || return 0
-    while (( $(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.yaml' | wc -l) > 3 )); do
-        old="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.yaml' -printf '%T@ %p\n' 2>/dev/null | sort -n | head -n1 | cut -d' ' -f2-)"
-        [[ -n "$old" && "$old" == "$BACKUP_DIR"/* ]] || break
-        rm -f -- "$old"
-    done
+    expired="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.yaml' -printf '%T@ %p\n' |
+        sort -rn | tail -n +4 | cut -d' ' -f2-)" || return 1
+    [[ -n "$expired" ]] || return 0
+    while IFS= read -r old; do
+        [[ "$old" == "$BACKUP_DIR"/* ]] || return 1
+        rm -f -- "$old" || return 1
+    done <<<"$expired"
 }
 
 activate_server_config() {
@@ -1219,27 +1251,25 @@ client_tun_excludes_server() {
 }
 
 client_server_value() {
-    local host="$SERVER_ADDRESS"
-    valid_ipv6 "$host" && host="[$host]"
-    printf '%s:%s' "$host" "$SERVER_PORT"
+    printf '%s:%s' "$(host_for_uri "$SERVER_ADDRESS")" "$SERVER_PORT"
 }
 
-write_client_tls_block() {
-    local output="$1"
-    {
-        printf 'tls:\n'
-        printf '  sni: %s\n' "$(yaml_quote "$TLS_SNI")"
-        if [[ "$TLS_INSECURE" == "1" ]]; then
-            printf '  insecure: true\n'
-            printf '  pinSHA256: %s\n' "$(yaml_quote "$TLS_PIN_SHA256")"
-        else
-            printf '  insecure: false\n'
-        fi
-    } >>"$output"
+write_client_connection_block() {
+    printf 'server: %s\n' "$(yaml_quote "$1")"
+    printf 'auth: %s\n' "$(yaml_quote "$AUTH_PASSWORD")"
+    printf 'obfs:\n  type: salamander\n  salamander:\n    password: %s\n' "$(yaml_quote "$OBFS_PASSWORD")"
+    printf 'tls:\n'
+    printf '  sni: %s\n' "$(yaml_quote "$TLS_SNI")"
+    if [[ "$TLS_INSECURE" == "1" ]]; then
+        printf '  insecure: true\n'
+        printf '  pinSHA256: %s\n' "$(yaml_quote "$TLS_PIN_SHA256")"
+    else
+        printf '  insecure: false\n'
+    fi
 }
 
 generate_client_configs() {
-    local server_value socks_file tun_file url_file uri_host uri_port query uri candidate seen="|" ipv4_yaml="" ipv6_yaml=""
+    local server_value connection_block socks_file tun_file url_file query candidate seen="|" ipv4_yaml="" ipv6_yaml=""
     local encoded_auth encoded_sni encoded_obfs encoded_pin
     managed_paths_are_safe || return 1
     encoded_auth="$(uri_encode "$AUTH_PASSWORD")" || return 1
@@ -1248,6 +1278,7 @@ generate_client_configs() {
     encoded_pin="$(uri_encode "$TLS_PIN_SHA256")" || return 1
     mkdir -p "$CLIENT_DIR" || return 1
     server_value="$(client_server_value)"
+    connection_block="$(write_client_connection_block "$server_value")" || return 1
     socks_file="$CLIENT_DIR/hy-client.yaml"
     tun_file="$CLIENT_DIR/hy-client-tun.yaml"
     url_file="$CLIENT_DIR/url.txt"
@@ -1255,11 +1286,8 @@ generate_client_configs() {
 
     {
         printf '# Hysteria 2 client - SOCKS5 mode\n'
-        printf 'server: %s\n' "$(yaml_quote "$server_value")"
-        printf 'auth: %s\n' "$(yaml_quote "$AUTH_PASSWORD")"
-        printf 'obfs:\n  type: salamander\n  salamander:\n    password: %s\n' "$(yaml_quote "$OBFS_PASSWORD")"
+        printf '%s\n' "$connection_block"
     } >"$socks_file" || return 1
-    write_client_tls_block "$socks_file" || return 1
     cat >>"$socks_file" <<'EOF' || return 1
 socks5:
   listen: 127.0.0.1:1080
@@ -1269,11 +1297,8 @@ EOF
     {
         printf '# Hysteria 2 client - native TUN mode (run as administrator/root)\n'
         printf '# macOS: change tun.name below to utun followed by a number, for example utun123.\n'
-        printf 'server: %s\n' "$(yaml_quote "$server_value")"
-        printf 'auth: %s\n' "$(yaml_quote "$AUTH_PASSWORD")"
-        printf 'obfs:\n  type: salamander\n  salamander:\n    password: %s\n' "$(yaml_quote "$OBFS_PASSWORD")"
+        printf '%s\n' "$connection_block"
     } >"$tun_file" || return 1
-    write_client_tls_block "$tun_file" || return 1
     while IFS= read -r candidate; do
         [[ -n "$candidate" && "$seen" != *"|${candidate}|"* ]] || continue
         if valid_ipv4 "$candidate"; then
@@ -1300,13 +1325,10 @@ EOF
     if [[ -n "$ipv4_yaml" ]]; then printf '    ipv4Exclude:\n%s' "$ipv4_yaml" >>"$tun_file" || return 1; fi
     if [[ -n "$ipv6_yaml" ]]; then printf '    ipv6Exclude:\n%s' "$ipv6_yaml" >>"$tun_file" || return 1; fi
 
-    uri_host="$(host_for_uri "$SERVER_ADDRESS")"
-    uri_port="$SERVER_PORT"
     query="sni=${encoded_sni}&obfs=salamander&obfs-password=${encoded_obfs}"
     [[ "$TLS_INSECURE" == "1" ]] && query+="&insecure=1"
     [[ -n "$TLS_PIN_SHA256" ]] && query+="&pinSHA256=${encoded_pin}"
-    uri="hysteria2://${encoded_auth}@${uri_host}:${uri_port}/?${query}#hy2"
-    printf '%s\n' "$uri" >"$url_file" || return 1
+    printf 'hysteria2://%s@%s/?%s#hy2\n' "$encoded_auth" "$server_value" "$query" >"$url_file" || return 1
     chmod 600 "$socks_file" "$tun_file" "$url_file"
 }
 
@@ -1321,8 +1343,6 @@ yaml_value_in_section() {
         }
     ' "$file"
 }
-
-yaml_password_in_section() { yaml_value_in_section "$1" password "$2"; }
 
 certificate_is_self_signed() {
     local cert="$1" subject issuer
@@ -1391,10 +1411,10 @@ read_current_config() {
         fi
     fi
     if [[ -z "$AUTH_PASSWORD" ]]; then
-        value="$(yaml_password_in_section auth "$CONFIG_FILE")"; AUTH_PASSWORD="$(yaml_unquote "$value")"
+        value="$(yaml_value_in_section auth password "$CONFIG_FILE")"; AUTH_PASSWORD="$(yaml_unquote "$value")"
     fi
     if [[ -z "$OBFS_PASSWORD" ]]; then
-        value="$(yaml_password_in_section obfs "$CONFIG_FILE")"; OBFS_PASSWORD="$(yaml_unquote "$value")"
+        value="$(yaml_value_in_section obfs password "$CONFIG_FILE")"; OBFS_PASSWORD="$(yaml_unquote "$value")"
     fi
     if [[ -z "$SERVER_PORT" ]]; then
         listen="$(awk '/^listen:[[:space:]]*/ {sub(/^listen:[[:space:]]*:*/, ""); print; exit}' "$CONFIG_FILE")"
@@ -1471,6 +1491,10 @@ installation_is_not_pending_uninstall() {
     }
 }
 
+script_version_from() {
+    sed -nE 's/^readonly SCRIPT_VERSION="([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' "$1"
+}
+
 install_management_command() {
     local source_path target_path installed_version
     source_path="$(readlink -f "${BASH_SOURCE[0]:-}")" || return 1
@@ -1478,7 +1502,7 @@ install_management_command() {
     target_path="$(readlink -f "$MANAGEMENT_BIN" 2>/dev/null || printf '%s' "$MANAGEMENT_BIN")"
     [[ "$source_path" == "$target_path" ]] && return 0
     if [[ -f "$MANAGEMENT_BIN" ]]; then
-        installed_version="$(sed -nE 's/^readonly SCRIPT_VERSION="([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' "$MANAGEMENT_BIN")"
+        installed_version="$(script_version_from "$MANAGEMENT_BIN")"
         if [[ -n "$installed_version" ]] && ! version_at_least "$SCRIPT_VERSION" "$installed_version"; then
             error "当前脚本 v${SCRIPT_VERSION} 旧于管理命令 v${installed_version}，已拒绝降级。"; return 1
         fi
@@ -1487,7 +1511,7 @@ install_management_command() {
 }
 
 update_script() (
-    local candidate remote_version
+    local candidate remote_version installed_version current_version="$SCRIPT_VERSION"
     require_root || return 1
     installation_is_not_pending_uninstall || return 1
     managed_paths_are_safe || { error "托管路径检查失败，已拒绝更新管理脚本。"; return 1; }
@@ -1495,20 +1519,22 @@ update_script() (
         error "未找到本脚本的有效安装或管理命令路径异常，请先使用下载的脚本安装。"
         return 1
     fi
+    installed_version="$(script_version_from "$MANAGEMENT_BIN")" || return 1
+    if version_at_least "$installed_version" "$current_version"; then current_version="$installed_version"; fi
     candidate="$(mktemp /tmp/hy2-script-update.XXXXXX)" || return 1
     trap 'rm -f -- "$candidate"' EXIT
-    info "从 GitHub 检查管理脚本更新（当前 v${SCRIPT_VERSION}）"
+    info "从 GitHub 检查管理脚本更新（当前 v${current_version}）"
     if ! download_checked_script "$REPO_RAW_URL" "$candidate"; then
         error "下载或语法检查失败，现有管理脚本保持不变。"
         return 1
     fi
-    remote_version="$(sed -nE 's/^readonly SCRIPT_VERSION="([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' "$candidate")"
+    remote_version="$(script_version_from "$candidate")"
     if [[ "$(head -n 1 "$candidate")" != '#!/usr/bin/env bash' || ! "$remote_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         error "下载内容的脚本标识或版本无效，现有管理脚本保持不变。"
         return 1
     fi
-    if version_at_least "$SCRIPT_VERSION" "$remote_version"; then
-        info "当前 v${SCRIPT_VERSION} 不低于 GitHub 版本 v${remote_version}，无需更新。"
+    if version_at_least "$current_version" "$remote_version"; then
+        info "当前 v${current_version} 不低于 GitHub 版本 v${remote_version}，无需更新。"
         return 0
     fi
     if ! atomic_install_file "$candidate" "$MANAGEMENT_BIN" 755 root root; then
@@ -1606,38 +1632,23 @@ perform_install() {
     fi
     if ! install_core_and_unit; then rollback_transaction; return 1; fi
 
+    CERT_MODE="$next_mode"; ACME_CERT_OWNED="0"
+    ACME_CHALLENGE_PORT=""; ACME_CHALLENGE_METHOD=""; ACME_WEBROOT=""
+    if [[ -n "$acme_identifier" && "$previous_cert_mode" == "$next_mode" && "$previous_sni" == "$acme_identifier" ]]; then
+        ACME_CERT_OWNED="$previous_acme_cert_owned"
+    fi
     case "$cert_strategy" in
-        quick)
-            ACME_CERT_OWNED="0"
-            if [[ "$previous_cert_mode" == "ip-acme" && "$previous_sni" == "$PUBLIC_IP" ]]; then ACME_CERT_OWNED="$previous_acme_cert_owned"; fi
-            configure_quick_certificate || { rollback_transaction; return 1; }
-            ;;
-        ip-acme)
-            CERT_MODE="ip-acme"; ACME_CERT_OWNED="0"
-            if [[ "$previous_cert_mode" == "ip-acme" && "$previous_sni" == "$PUBLIC_IP" ]]; then ACME_CERT_OWNED="$previous_acme_cert_owned"; fi
-            issue_acme_certificate "$PUBLIC_IP" ip-acme || { rollback_transaction; return 1; }
-            ;;
-        domain-acme)
-            CERT_MODE="domain-acme"; ACME_CERT_OWNED="0"
-            if [[ "$previous_cert_mode" == "domain-acme" && "$previous_sni" == "$TLS_SNI" ]]; then ACME_CERT_OWNED="$previous_acme_cert_owned"; fi
-            issue_acme_certificate "$TLS_SNI" domain-acme || { rollback_transaction; return 1; }
-            ;;
-        existing)
-            CERT_MODE="existing"; ACME_CERT_OWNED="0"
-            ACME_CHALLENGE_PORT=""; ACME_CHALLENGE_METHOD=""; ACME_WEBROOT=""
-            configure_existing_certificate "$source_cert" "$source_key" "$TLS_SNI" || { rollback_transaction; return 1; }
-            ;;
-        selfsigned)
-            CERT_MODE="selfsigned"; ACME_CHALLENGE_PORT=""; ACME_CHALLENGE_METHOD=""; ACME_WEBROOT=""; ACME_CERT_OWNED="0"
-            generate_self_signed_certificate "$TLS_SNI" || { rollback_transaction; return 1; }
-            ;;
-        *) rollback_transaction; return 1 ;;
-    esac
+        quick) configure_quick_certificate ;;
+        ip-acme|domain-acme) issue_acme_certificate "$acme_identifier" "$CERT_MODE" ;;
+        existing) configure_existing_certificate "$source_cert" "$source_key" "$TLS_SNI" ;;
+        selfsigned) generate_self_signed_certificate "$TLS_SNI" ;;
+        *) false ;;
+    esac || { rollback_transaction; return 1; }
 
-    if ! save_installer_state; then rollback_transaction; return 1; fi
-    if ! activate_server_config; then rollback_transaction; return 1; fi
-    if ! generate_client_configs || ! install_management_command; then rollback_transaction; return 1; fi
-    if ! secure_files; then rollback_transaction; return 1; fi
+    if ! save_installer_state || ! activate_server_config || ! generate_client_configs ||
+        ! install_management_command || ! secure_files; then
+        rollback_transaction; return 1
+    fi
     commit_transaction || warn "请按上方路径人工删除旧配置快照。"
     cleanup_legacy_artifacts || warn "旧版辅助文件未能完整清理。"
     cleanup_failed_acme_attempt || warn "未能完整清理失败的 ACME 申请，相关资源已保留。"
@@ -1868,17 +1879,15 @@ update_core() {
     read_current_config || { error "尚未安装。"; return 1; }
     check_udp_port_available || return 1
     begin_transaction || return 1
-    if ! install_hysteria_core || ! ensure_service_unit || ! systemctl restart "$SERVICE_NAME"; then
+    if ! install_hysteria_core || ! ensure_service_unit || ! systemctl restart "$SERVICE_NAME" || ! check_service_health; then
         rollback_transaction; return 1
     fi
-    if ! check_service_health; then rollback_transaction; return 1; fi
     commit_transaction || warn "请按上方路径人工删除旧内核快照。"
     success "内核已更新，服务运行正常。"
 }
 
 remove_acme_assets() {
     local identifier="$1"
-    [[ -x "$ACME_HOME/acme.sh" ]] || return 0
     if [[ "$CERT_MODE" == "ip-acme" || "$CERT_MODE" == "domain-acme" ]]; then
         if [[ "$ACME_CERT_OWNED" == "1" ]]; then
             remove_acme_order_if_owned "$identifier" "$ACME_CERT_OWNED" || return 1

@@ -60,6 +60,97 @@ assert_eq() { [[ "$1" == "$2" ]] || fail "expected [$2], got [$1]"; }
 assert_contains() { grep -Fq -- "$2" "$1" || fail "$1 does not contain: $2"; }
 assert_not_contains() { ! grep -Fq -- "$2" "$1" || fail "$1 unexpectedly contains: $2"; }
 
+# Certificate names must match SANs, including on OpenSSL 1.1.1.
+(
+    cert="$TEST_ROOT/name-check.crt"; key="$TEST_ROOT/name-check.key"
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 2 \
+        -keyout "$key" -out "$cert" -subj '/CN=example.com' \
+        -addext 'subjectAltName=DNS:example.com,DNS:*.example.net,IP:203.0.113.10,IP:2001:db8::10' >/dev/null 2>&1
+    for name in example.com sub.example.net 203.0.113.10 2001:db8::10; do
+        certificate_matches_name "$cert" "$name" || fail "matching SAN was rejected: $name"
+    done
+    for name in other.example.com sub.sub.example.net 203.0.113.99 2001:db8::99; do
+        if certificate_matches_name "$cert" "$name"; then fail "mismatched SAN was accepted: $name"; fi
+    done
+    openssl req -x509 -key "$key" -days 2 -out "$cert" -subj '/CN=cn-only.example.com' >/dev/null 2>&1
+    if certificate_matches_name "$cert" cn-only.example.com; then fail "a CN-only certificate was accepted"; fi
+    openssl req -x509 -key "$key" -days 2 -out "$cert" -subj '/CN=cn-only.example.com' \
+        -addext 'subjectAltName=IP:203.0.113.10' >/dev/null 2>&1
+    if certificate_matches_name "$cert" cn-only.example.com; then fail "an IP SAN enabled DNS fallback to CN"; fi
+    openssl req -x509 -key "$key" -days 2 -out "$cert" -subj '/CN=cn-only.example.com' \
+        -addext 'subjectAltName=URI:https://example.net/ DNS:cn-only.example.com' >/dev/null 2>&1
+    if certificate_matches_name "$cert" cn-only.example.com; then fail "text inside a URI SAN was treated as a DNS SAN"; fi
+    openssl req -x509 -key "$key" -days 2 -out "$cert" -subj '/CN=cn-only.example.com' \
+        -addext 'subjectAltName=critical,DNS:example.com' >/dev/null 2>&1
+    certificate_matches_name "$cert" example.com || fail "a critical DNS SAN was rejected"
+
+    # OpenSSL 1.1.1 reports mismatches in stdout while returning zero.
+    openssl() {
+        if [[ "$1" == asn1parse ]]; then
+            if [[ "$#" == 3 ]]; then
+                printf '100:d=2 hl=2 l=30 cons: cont [ 3 ]\n105:d=5 hl=2 l=3 prim: OBJECT :X509v3 Subject Alternative Name\n110:d=5 hl=2 l=20 prim: OCTET STRING\n'
+            else
+                printf '0:d=0 hl=2 l=18 cons: SEQUENCE\n2:d=1 hl=2 l=16 prim: cont [ 2 ]\n'
+            fi
+            return 0
+        fi
+        case "$5" in
+            -checkhost) printf 'Hostname %s does NOT match certificate\n' "$6" ;;
+            -checkip) printf 'IP %s does NOT match certificate\n' "$6" ;;
+            *) fail "unexpected certificate command: $*" ;;
+        esac
+    }
+    for name in example.com 203.0.113.99; do
+        if certificate_matches_name "$cert" "$name"; then fail "a zero-status name mismatch was accepted"; fi
+    done
+)
+
+# A stale running copy cannot downgrade the installed management command.
+(
+    require_root() { return 0; }
+    CONFIG_FILE="$TEST_ROOT/update-config.yaml"; STATE_FILE="$TEST_ROOT/update-state.conf"
+    MANAGEMENT_BIN="$TEST_ROOT/update-hy2"
+    : >"$CONFIG_FILE"
+    printf 'version=%s\nuninstall_pending=0\n' "$SCRIPT_VERSION" >"$STATE_FILE"
+    printf '#!/usr/bin/env bash\nreadonly SCRIPT_VERSION="99.0.0"\n' >"$MANAGEMENT_BIN"
+    downloaded_version=50.0.0
+    download_checked_script() {
+        printf '#!/usr/bin/env bash\nreadonly SCRIPT_VERSION="%s"\n' "$downloaded_version" >"$2"
+    }
+    update_script >"$TEST_ROOT/update.log" 2>&1 || fail "a newer installed version was treated as an update failure"
+    assert_contains "$MANAGEMENT_BIN" '99.0.0'
+
+    printf '#!/usr/bin/env bash\nreadonly SCRIPT_VERSION="%s"\n' "$SCRIPT_VERSION" >"$MANAGEMENT_BIN"
+    update_script >"$TEST_ROOT/update.log" 2>&1 || fail "a valid management update failed"
+    assert_contains "$MANAGEMENT_BIN" '50.0.0'
+    downloaded_version=1.0.0
+    update_script >"$TEST_ROOT/update.log" 2>&1 || fail "an older remote version was treated as an update failure"
+    assert_contains "$MANAGEMENT_BIN" '50.0.0'
+
+    downloaded_version=100.0.0
+    atomic_install_file() { return 1; }
+    if update_script >"$TEST_ROOT/update.log" 2>&1; then fail "an unsuccessful script replacement reported success"; fi
+    assert_contains "$MANAGEMENT_BIN" '50.0.0'
+)
+
+# Missing acme.sh cannot silently bypass removal of an active owned order.
+(
+    ACME_HOME="$TEST_ROOT/missing-acme-client"
+    CERT_MODE=domain-acme; ACME_OWNED=0; ACME_CERT_OWNED=1
+    identifier=example.com
+    order="$ACME_HOME/${identifier}_ecc/$identifier.conf"
+    mkdir -p "${order%/*}"
+    printf 'active-order\n' >"$order"
+    if remove_acme_assets "$identifier" 2>/dev/null; then fail "an active owned order survived successful cleanup"; fi
+    assert_contains "$order" active-order
+    mv "$order" "$order.removed"
+    remove_acme_assets "$identifier" || fail "a previously removed order required the missing client"
+    assert_eq "$ACME_CERT_OWNED" 0
+    printf 'external-order\n' >"$order"
+    remove_acme_assets "$identifier"
+    assert_contains "$order" external-order
+)
+
 # The lock covers CLI/menu dispatch, survives competing processes, and releases on exit.
 if has_cmd flock; then
     script_under_test="$(cd "$(dirname "$0")/.." && pwd)/hysteria.sh"
@@ -171,6 +262,35 @@ assert_eq "$(uri_encode '中文 pass')" '%E4%B8%AD%E6%96%87%20pass'
 (
     od() { return 1; }
     if uri_encode nonempty; then fail "URI encoding swallowed an od failure"; fi
+)
+
+# Rotation keeps the newest three backups and reports listing/deletion failures.
+(
+    BACKUP_DIR="$TEST_ROOT/backups with spaces"
+    rotate_backups || fail "missing backup directory was rejected"
+    mkdir -p "$BACKUP_DIR"
+    for index in 1 2 3 4 5 6; do
+        touch -t "2020010${index}0000" "$BACKUP_DIR/config-${index} backup.yaml"
+    done
+    printf 'keep\n' >"$BACKUP_DIR/unmanaged.txt"
+    rotate_backups
+    assert_eq "$(find "$BACKUP_DIR" -name 'config-*.yaml' | wc -l | tr -d '[:space:]')" 3
+    for index in 4 5 6; do
+        [[ -f "$BACKUP_DIR/config-${index} backup.yaml" ]] || fail "a recent backup was deleted"
+    done
+    assert_contains "$BACKUP_DIR/unmanaged.txt" keep
+    rotate_backups || fail "three backups triggered unnecessary removal"
+    touch -t 200001010000 "$BACKUP_DIR/config-old.yaml"
+    remove_calls=0
+    rm() {
+        remove_calls=$((remove_calls + 1))
+        ((remove_calls == 1)) || fail "rotation retried a failed deletion"
+        return 1
+    }
+    if rotate_backups; then fail "backup deletion failure was ignored"; fi
+    unset -f rm
+    find() { return 1; }
+    if rotate_backups; then fail "backup listing failure was ignored"; fi
 )
 (
     require_root() { return 0; }
@@ -289,6 +409,24 @@ assert_contains "$CLIENT_DIR/hy-client.yaml" 'insecure: true'
 assert_contains "$CLIENT_DIR/hy-client.yaml" 'pinSHA256:'
 assert_contains "$CLIENT_DIR/url.txt" 'insecure=1'
 assert_contains "$CLIENT_DIR/url.txt" 'pinSHA256='
+
+# Both modes share identical connection settings, including escaped credentials.
+(
+    AUTH_PASSWORD='中文 "auth" \ pass'
+    OBFS_PASSWORD='obfs "quoted" \ pass'
+    for SERVER_ADDRESS in 203.0.113.10 2001:db8::10 proxy.example.com; do
+        for TLS_INSECURE in 0 1; do
+            if [[ "$TLS_INSECURE" == 1 ]]; then TLS_PIN_SHA256='AA:BB'; else TLS_PIN_SHA256=''; fi
+            generate_client_configs
+            assert_eq \
+                "$(sed -n '/^server:/,/^socks5:/{ /^socks5:/d; p; }' "$CLIENT_DIR/hy-client.yaml")" \
+                "$(sed -n '/^server:/,/^tun:/{ /^tun:/d; p; }' "$CLIENT_DIR/hy-client-tun.yaml")"
+            assert_contains "$CLIENT_DIR/hy-client.yaml" "auth: $(yaml_quote "$AUTH_PASSWORD")"
+            assert_contains "$CLIENT_DIR/hy-client-tun.yaml" "password: $(yaml_quote "$OBFS_PASSWORD")"
+            assert_contains "$CLIENT_DIR/url.txt" "@$(client_server_value)/?"
+        done
+    done
+)
 
 # Detect the leaf public key, not the CA signature algorithm.
 compat_log="$TEST_ROOT/certificate-compatibility.log"
@@ -793,6 +931,56 @@ if (
     if check_service_health; then fail "health check accepted a restarted service"; fi
     systemctl() { if [[ "$1" == show ]]; then printf '0\n'; else return 0; fi; }
     check_service_health || fail "healthy service was rejected"
+)
+
+# ACME dispatch preserves ownership only when mode and identifier both match.
+(
+    STATE_FILE="$TEST_ROOT/dispatch-state.conf"
+    : >"$STATE_FILE"
+    PUBLIC_IP=203.0.113.10
+    load_installer_state() { return 0; }
+    load_resource_ownership() { return 0; }
+    state_get() {
+        case "$1" in
+            cert_mode) printf '%s' "$previous_mode" ;;
+            tls_sni) printf '%s' "$previous_identifier" ;;
+            acme_cert_owned) printf '%s' "$previous_owned" ;;
+            uninstall_pending) printf '0' ;;
+            *) return 1 ;;
+        esac
+    }
+    check_udp_port_available() { return 0; }
+    cleanup_previous_acme_certificate() { return 0; }
+    begin_transaction() { return 0; }
+    install_core_and_unit() { return 0; }
+    configure_quick_certificate() { certificate_call="quick $PUBLIC_IP"; }
+    issue_acme_certificate() { certificate_call="$2 $1"; }
+    save_installer_state() { return 0; }
+    activate_server_config() { return 0; }
+    generate_client_configs() { return 0; }
+    install_management_command() { return 0; }
+    secure_files() { return 0; }
+    commit_transaction() { return 0; }
+    cleanup_legacy_artifacts() { return 0; }
+    cleanup_failed_acme_attempt() { return 0; }
+    print_client_result() { return 0; }
+    rollback_transaction() { fail "successful certificate dispatch rolled back"; }
+    for strategy in quick ip-acme domain-acme; do
+        previous_mode=ip-acme; identifier="$PUBLIC_IP"
+        if [[ "$strategy" == domain-acme ]]; then previous_mode=domain-acme; identifier=example.com; fi
+        for reuse in external owned changed; do
+            previous_identifier="$identifier"; previous_owned=1; expected_owned=1
+            case "$reuse" in
+                external) previous_owned=0; expected_owned=0 ;;
+                changed) previous_identifier=old.example.com; expected_owned=0 ;;
+            esac
+            TLS_SNI="$identifier"; ACME_CERT_OWNED=1; certificate_call=""
+            perform_install "$strategy" || fail "certificate strategy $strategy failed"
+            assert_eq "$certificate_call" "$strategy $identifier"
+            assert_eq "$CERT_MODE" "$previous_mode"
+            assert_eq "$ACME_CERT_OWNED" "$expected_owned"
+        done
+    done
 )
 
 # Retire the old writer before changing certificates, and restore it on later failure.
